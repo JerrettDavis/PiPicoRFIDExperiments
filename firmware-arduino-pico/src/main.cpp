@@ -27,6 +27,13 @@ String lastUid;
 unsigned long lastPollMs = 0;
 bool cardPresent = false;
 
+// RESCAN: while the SAME card stays continuously present, re-emit
+// EVENT CARD_PRESENT every rescanIntervalMs (0 = disabled, emit once per
+// physical insertion). millis()-based; the periodic re-emit does NOT re-fire
+// the LED blink burst (only a genuinely new insertion does).
+unsigned long rescanIntervalMs = 0;
+unsigned long lastEmitMs = 0;
+
 // --- Onboard LED indicator (local-only; does not affect serial protocol) ---
 // Non-blocking state machine: on the edge a card newly appears we run a short
 // blink burst, then hold the LED solid ON while the card stays present, and
@@ -144,7 +151,7 @@ static String currentUidHex() {
 }
 
 static void emitReady() {
-  Serial.println("READY RP2040_RFID_USB 0.1.0");
+  Serial.println("READY RP2040_RFID_USB 0.2.0");
   Serial.println("PINS SS=17 SCK=18 MOSI=19 MISO=16 RST=20 IRQ=21");
   Serial.println("TYPE HELP");
 }
@@ -153,13 +160,18 @@ static void printHelp() {
   Serial.println("OK COMMANDS");
   Serial.println("  PING");
   Serial.println("  VERSION");
+  Serial.println("  RESCAN [ms]");
   Serial.println("  SCAN");
   Serial.println("  READ_BLOCK <block> [keyAhex12]");
   Serial.println("  WRITE_BLOCK <block> <hex32> [keyAhex12]");
   Serial.println("  DUMP <startBlock> <endBlock> [keyAhex12]");
+  Serial.println("  READ_PAGE <page>");
+  Serial.println("  WRITE_PAGE <page> <hex8>");
   Serial.println("NOTES");
   Serial.println("  Default key is FFFFFFFFFFFF");
   Serial.println("  WRITE_BLOCK refuses block 0 and sector trailer blocks for safety");
+  Serial.println("  RESCAN <ms>: re-emit EVENT CARD_PRESENT every ms while same card present (0=off)");
+  Serial.println("  READ_PAGE/WRITE_PAGE target Ultralight/NTAG (no auth); WRITE_PAGE refuses pages 0-3");
 }
 
 static bool selectCard() {
@@ -196,12 +208,63 @@ static bool loadKey(const String& keyHex, MFRC522::MIFARE_Key& key) {
   return true;
 }
 
-static bool isSectorTrailer(byte block) {
-  return block % 4 == 3;
+// --- Card-type classification (uses base miguelbalboa/MFRC522 PICC_GetType) ---
+enum class CardFamily { CLASSIC, ULTRALIGHT, ISO4, UNKNOWN };
+
+static CardFamily cardFamily(MFRC522::PICC_Type type) {
+  switch (type) {
+    case MFRC522::PICC_TYPE_MIFARE_MINI:
+    case MFRC522::PICC_TYPE_MIFARE_1K:
+    case MFRC522::PICC_TYPE_MIFARE_4K:
+      return CardFamily::CLASSIC;
+    case MFRC522::PICC_TYPE_MIFARE_UL:   // Ultralight + NTAG21x
+      return CardFamily::ULTRALIGHT;
+    case MFRC522::PICC_TYPE_ISO_14443_4:
+    case MFRC522::PICC_TYPE_ISO_18092:
+      return CardFamily::ISO4;
+    default:
+      return CardFamily::UNKNOWN;
+  }
 }
 
+// Stable, no-space token for the SCAN response and ERR messages.
+static String typeToken(MFRC522::PICC_Type type) {
+  switch (type) {
+    case MFRC522::PICC_TYPE_MIFARE_MINI: return "MIFARE_MINI";
+    case MFRC522::PICC_TYPE_MIFARE_1K:   return "MIFARE_1K";
+    case MFRC522::PICC_TYPE_MIFARE_4K:   return "MIFARE_4K";
+    case MFRC522::PICC_TYPE_MIFARE_UL:   return "MIFARE_UL";
+    case MFRC522::PICC_TYPE_MIFARE_PLUS: return "MIFARE_PLUS";
+    case MFRC522::PICC_TYPE_ISO_14443_4: return "ISO_14443_4";
+    case MFRC522::PICC_TYPE_ISO_18092:   return "ISO_18092";
+    default:                             return "UNKNOWN";
+  }
+}
+
+// Classify the currently-selected card (rfid.uid must be valid).
+static CardFamily currentCardFamily() {
+  return cardFamily(rfid.PICC_GetType(rfid.uid.sak));
+}
+
+static String currentTypeToken() {
+  return typeToken(rfid.PICC_GetType(rfid.uid.sak));
+}
+
+// MIFARE Classic sector-trailer geometry. 1K/Mini: 16-block sectors of 4 blocks
+// (trailer = sectorStart+3). 4K sectors 32-39 are 16 blocks each (trailer =
+// sectorStart+15). This helper returns the correct trailer for any 0-255 block.
 static byte trailerForBlock(byte block) {
-  return (block / 4) * 4 + 3;
+  if (block < 128) {
+    // Sectors 0-31: 4 blocks each.
+    return (block / 4) * 4 + 3;
+  }
+  // Sectors 32-39 (blocks 128-255): 16 blocks each, trailer = start+15.
+  byte sectorStart = 128 + ((block - 128) / 16) * 16;
+  return sectorStart + 15;
+}
+
+static bool isSectorTrailer(byte block) {
+  return block == trailerForBlock(block);
 }
 
 static bool authenticateBlock(byte block, const String& keyHex) {
@@ -245,14 +308,16 @@ static void commandScan() {
     return;
   }
 
+  // Normalized response: TYPE is a no-space token; SIZE is the UID byte length.
   Serial.print("OK UID=");
   Serial.print(currentUidHex());
+  Serial.print(" SIZE=");
+  Serial.print(rfid.uid.size);
   Serial.print(" SAK=0x");
   if (rfid.uid.sak < 0x10) Serial.print('0');
   Serial.print(rfid.uid.sak, HEX);
   Serial.print(" TYPE=");
-  MFRC522::PICC_Type type = rfid.PICC_GetType(rfid.uid.sak);
-  Serial.println(rfid.PICC_GetTypeName(type));
+  Serial.println(currentTypeToken());
 }
 
 static void commandReadBlock(byte block, const String& keyHex) {
@@ -261,7 +326,23 @@ static void commandReadBlock(byte block, const String& keyHex) {
     return;
   }
 
+  // Dispatch on card family BEFORE any auth so non-Classic cards never hit the
+  // Classic Key-A path (which would return a confusing ERR AUTH Timeout).
+  CardFamily fam = currentCardFamily();
+  if (fam == CardFamily::ULTRALIGHT) {
+    Serial.println("ERR WRONG_CARD_TYPE USE=READ_PAGE");
+    rfid.PICC_HaltA();
+    return;
+  }
+  if (fam != CardFamily::CLASSIC) {
+    Serial.print("ERR UNSUPPORTED_CARD TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+    return;
+  }
+
   if (!authenticateBlock(block, keyHex)) {
+    rfid.PICC_HaltA();   // release the selected card on the early-exit path too
     stopCardCrypto();
     return;
   }
@@ -305,7 +386,22 @@ static void commandWriteBlock(byte block, const String& dataHex, const String& k
     return;
   }
 
+  // Dispatch on card family before any auth.
+  CardFamily fam = currentCardFamily();
+  if (fam == CardFamily::ULTRALIGHT) {
+    Serial.println("ERR WRONG_CARD_TYPE USE=WRITE_PAGE");
+    rfid.PICC_HaltA();
+    return;
+  }
+  if (fam != CardFamily::CLASSIC) {
+    Serial.print("ERR UNSUPPORTED_CARD TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+    return;
+  }
+
   if (!authenticateBlock(block, keyHex)) {
+    rfid.PICC_HaltA();   // release the selected card on the early-exit path too
     stopCardCrypto();
     return;
   }
@@ -333,6 +429,20 @@ static void commandDump(byte startBlock, byte endBlock, const String& keyHex) {
 
   if (!selectCard()) {
     Serial.println("ERR NO_CARD");
+    return;
+  }
+
+  // Dispatch on card family before any auth.
+  CardFamily fam = currentCardFamily();
+  if (fam == CardFamily::ULTRALIGHT) {
+    Serial.println("ERR WRONG_CARD_TYPE USE=READ_PAGE");
+    rfid.PICC_HaltA();
+    return;
+  }
+  if (fam != CardFamily::CLASSIC) {
+    Serial.print("ERR UNSUPPORTED_CARD TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
     return;
   }
 
@@ -376,6 +486,94 @@ static void commandDump(byte startBlock, byte endBlock, const String& keyHex) {
   Serial.println("OK DUMP_END");
 }
 
+// READ_PAGE: Ultralight/NTAG read (no auth). MIFARE_Read returns 16 bytes
+// (4 pages) starting at the requested page.
+static void commandReadPage(byte page) {
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+
+  CardFamily fam = currentCardFamily();
+  if (fam == CardFamily::CLASSIC) {
+    Serial.println("ERR WRONG_CARD_TYPE USE=READ_BLOCK");
+    rfid.PICC_HaltA();
+    stopCardCrypto();
+    return;
+  }
+  if (fam != CardFamily::ULTRALIGHT) {
+    Serial.print("ERR UNSUPPORTED_CARD TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+    return;
+  }
+
+  byte buffer[18];
+  byte size = sizeof(buffer);
+  MFRC522::StatusCode status = rfid.MIFARE_Read(page, buffer, &size);
+  rfid.PICC_HaltA();  // Ultralight: halt only, no crypto to stop.
+
+  if (status != MFRC522::STATUS_OK) {
+    Serial.print("ERR READ ");
+    Serial.println(statusName(status));
+    return;
+  }
+
+  Serial.print("OK PAGE=");
+  Serial.print(page);
+  Serial.print(" DATA=");
+  Serial.println(bytesToHex(buffer, 16, false));  // 4 pages = 32 hex chars
+}
+
+// WRITE_PAGE: Ultralight/NTAG write (no auth, 4 bytes per page). Refuses pages
+// 0-3 (UID / lock bytes / OTP) to avoid bricking the tag.
+static void commandWritePage(byte page, const String& dataHex) {
+  byte data[4];
+  if (!hexToBytes(dataHex, data, 4)) {
+    Serial.println("ERR BAD_DATA expected 8 hex chars");
+    return;
+  }
+
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+
+  CardFamily fam = currentCardFamily();
+  if (fam == CardFamily::CLASSIC) {
+    Serial.println("ERR WRONG_CARD_TYPE USE=WRITE_BLOCK");
+    rfid.PICC_HaltA();
+    stopCardCrypto();
+    return;
+  }
+  if (fam != CardFamily::ULTRALIGHT) {
+    Serial.print("ERR UNSUPPORTED_CARD TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+    return;
+  }
+
+  if (page <= 3) {
+    Serial.println("ERR REFUSE_PAGE");
+    rfid.PICC_HaltA();
+    return;
+  }
+
+  MFRC522::StatusCode status = rfid.MIFARE_Ultralight_Write(page, data, 4);
+  rfid.PICC_HaltA();  // Ultralight: halt only.
+
+  if (status != MFRC522::STATUS_OK) {
+    Serial.print("ERR WRITE ");
+    Serial.println(statusName(status));
+    return;
+  }
+
+  Serial.print("OK WROTE_PAGE PAGE=");
+  Serial.print(page);
+  Serial.print(" DATA=");
+  Serial.println(bytesToHex(data, 4, false));
+}
+
 static String nextToken(String& rest) {
   rest.trim();
   if (rest.length() == 0) return "";
@@ -406,6 +604,22 @@ static void handleCommand(String line) {
     printHelp();
   } else if (cmd == "VERSION") {
     commandVersion();
+  } else if (cmd == "RESCAN") {
+    String msStr = nextToken(rest);
+    if (msStr.length() == 0) {
+      // Query current interval.
+      Serial.print("OK RESCAN ");
+      Serial.println(rescanIntervalMs);
+    } else {
+      long ms = msStr.toInt();
+      if (ms < 0) {
+        Serial.println("ERR BAD_INTERVAL");
+        return;
+      }
+      rescanIntervalMs = (unsigned long)ms;
+      Serial.print("OK RESCAN ");
+      Serial.println(rescanIntervalMs);
+    }
   } else if (cmd == "SCAN" || cmd == "UID" || cmd == "READ_UID") {
     commandScan();
   } else if (cmd == "READ_BLOCK") {
@@ -435,6 +649,31 @@ static void handleCommand(String line) {
       return;
     }
     commandWriteBlock((byte)block, dataHex, keyHex);
+  } else if (cmd == "READ_PAGE") {
+    String pageStr = nextToken(rest);
+    if (pageStr.length() == 0) {
+      Serial.println("ERR USAGE READ_PAGE <page>");
+      return;
+    }
+    int page = pageStr.toInt();
+    if (page < 0 || page > 255) {
+      Serial.println("ERR BAD_PAGE");
+      return;
+    }
+    commandReadPage((byte)page);
+  } else if (cmd == "WRITE_PAGE") {
+    String pageStr = nextToken(rest);
+    String dataHex = nextToken(rest);
+    if (pageStr.length() == 0 || dataHex.length() == 0) {
+      Serial.println("ERR USAGE WRITE_PAGE <page> <hex8>");
+      return;
+    }
+    int page = pageStr.toInt();
+    if (page < 0 || page > 255) {
+      Serial.println("ERR BAD_PAGE");
+      return;
+    }
+    commandWritePage((byte)page, dataHex);
   } else if (cmd == "DUMP") {
     String startStr = nextToken(rest);
     String endStr = nextToken(rest);
@@ -484,15 +723,23 @@ static void pollCardEvents() {
   // RC522 interrupt setup is easy to get wrong; polling keeps the browser workflow reliable.
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
     String uid = currentUidHex();
-    if (!cardPresent || uid != lastUid) {
+    unsigned long nowMs = millis();
+    bool isNewInsertion = (!cardPresent || uid != lastUid);
+    // Periodic re-scan: same card still present and the rescan interval elapsed.
+    bool isRescanReemit = (!isNewInsertion && rescanIntervalMs > 0 &&
+                           (nowMs - lastEmitMs >= rescanIntervalMs));
+    if (isNewInsertion || isRescanReemit) {
       cardPresent = true;
       lastUid = uid;
+      lastEmitMs = nowMs;
       Serial.print("EVENT CARD_PRESENT UID=");
       Serial.println(uid);
     }
     // Local LED indicator (debounced). A card was read this poll, so it is
     // present: clear the absent counter and, on the rising edge of the debounced
-    // presence, start the blink burst. Does not alter serial output.
+    // presence, start the blink burst. NOTE: this is gated on !ledPresent, so a
+    // RESCAN periodic re-emit (same card still present) does NOT re-fire the
+    // blink burst -- the LED simply stays solid ON. Does not alter serial output.
     ledAbsentCount = 0;
     if (!ledPresent) {
       ledPresent = true;
@@ -506,13 +753,18 @@ static void pollCardEvents() {
     // Local LED indicator (debounced): a single absent poll is NOT enough to
     // declare the card gone, because the card is halted after each read and so
     // is not reported as "new" every poll. Only after LED_ABSENT_DEBOUNCE
-    // consecutive absent polls do we treat the card as removed and turn the LED
-    // off. NOTE: we deliberately do NOT touch `cardPresent` here, so the
-    // EVENT CARD_PRESENT emission behavior stays byte-identical to the original.
+    // consecutive absent polls do we treat the card as genuinely removed: turn
+    // the LED off AND clear the `cardPresent` latch. Clearing cardPresent gives
+    // the firmware a real "card gone" edge so that (a) a re-presented card
+    // counts as a NEW insertion (fresh EVENT CARD_PRESENT + LED blink), and
+    // (b) RESCAN only re-emits while the SAME card is *continuously* present.
+    // With rescanIntervalMs==0 this does not change the observable behavior:
+    // emission is still exactly once per physical insertion.
     if (ledPresent) {
       if (ledAbsentCount < LED_ABSENT_DEBOUNCE) ledAbsentCount++;
       if (ledAbsentCount >= LED_ABSENT_DEBOUNCE) {
         ledPresent = false;
+        cardPresent = false;   // genuine "card gone" edge (debounce satisfied)
         ledOnCardState(false);
       }
     }

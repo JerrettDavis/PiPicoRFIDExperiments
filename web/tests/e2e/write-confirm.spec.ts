@@ -100,6 +100,32 @@ test('Data of 30 chars shows inline error, modal does not open', async ({ page }
   await expect(page.getByTestId('write-confirm-modal')).not.toBeVisible();
 });
 
+// ── 4K trailer geometry (B2 regression): upper sectors are 16 blocks ─────────
+
+for (const trailer of [143, 159, 175, 191, 207, 223, 239, 255]) {
+  test(`4K trailer block ${trailer} is caught client-side, modal does not open`, async ({ page }) => {
+    await page.getByTestId('input-block').fill(String(trailer));
+    await page.getByTestId('input-data').fill(NEW_DATA);
+    await page.getByTestId('btn-write').click();
+
+    await expect(page.getByTestId('write-error')).toContainText('sector trailer', { timeout: 2000 });
+    await expect(page.getByTestId('write-confirm-modal')).not.toBeVisible();
+    // Crucially: the confirm modal never opened, so no WRITE could be completed.
+    await expect(page.getByTestId('log')).not.toContainText('WROTE');
+  });
+}
+
+test('4K upper-area data block 144 is NOT blocked client-side (modal opens)', async ({ page }) => {
+  // 144 is the first data block of the first 16-block sector (128–143); only
+  // 143 is the trailer. The client must allow it (modal opens for confirm).
+  await page.getByTestId('input-block').fill('144');
+  await page.getByTestId('input-data').fill(NEW_DATA);
+  await page.getByTestId('btn-write').click();
+
+  await expect(page.getByTestId('write-confirm-modal')).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId('write-error')).not.toContainText('sector trailer');
+});
+
 // ── Raw command input routes WRITE_BLOCK through the two-step confirm ─────────
 
 test('Raw WRITE_BLOCK opens the confirm modal (does not send immediately)', async ({ page }) => {

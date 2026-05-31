@@ -1,25 +1,17 @@
 import type { RfidController } from './controller.js';
 import { cleanHex } from './protocol.js';
-import type { OpResult } from './types.js';
-
-/** Idle time (ms) with no CARD_PRESENT events — AND no auto-read in flight —
- *  after which the debounce resets so re-presenting the SAME card re-reads.
- *
- *  Must comfortably exceed a full auto-read worst case. One auto-read issues
- *  two controller commands (scan + readBlock), each bounded by the controller's
- *  TIMEOUT_MS (3000ms), so worst case ~6000ms. We use 7000ms as defense-in-depth
- *  on top of the in-flight guard, so a busy reader (not emitting CARD_PRESENT
- *  while servicing our commands) is never mistaken for an absent card. */
-export const ABSENCE_RESET_MS = 7000;
+import type { OpResult, CardFamily } from './types.js';
 
 export interface AutoReadDeps {
   controller: RfidController;
   /** Whether auto-read is currently enabled. */
   isEnabled: () => boolean;
-  /** Current block number from the UI inputs. */
+  /** Current block number (CLASSIC) from the UI inputs. */
   getBlock: () => number;
   /** Current Key A (raw, will be cleaned) from the UI inputs. */
   getKey: () => string;
+  /** Current page number (ULTRALIGHT) from the UI inputs. */
+  getPage: () => number;
   /** Called for each op result so the caller can render panel/badge/log. */
   onResult: (result: OpResult) => void;
   /** Optional logging hook (tx lines etc.). */
@@ -27,41 +19,31 @@ export interface AutoReadDeps {
 }
 
 /**
- * AutoReader hooks off unsolicited `EVENT CARD_PRESENT UID=<uid>` lines and,
- * when enabled, runs scan() then readBlock() through the existing controller
- * (so it is serialized with the in-flight queue).
+ * AutoReader hooks off unsolicited `EVENT CARD_PRESENT UID=<uid>` lines.
  *
- * Debounce contract:
- *  - The same UID seen repeatedly triggers exactly ONE auto-read...
- *  - ...until the card is "absent": if no CARD_PRESENT arrives for
- *    ABSENCE_RESET_MS *while no auto-read is in flight*, the remembered UID is
- *    cleared so re-presenting the same card reads again.
- *  - A DIFFERENT UID always triggers a fresh auto-read immediately.
- *  - While a scan+read is in flight the card is present by definition, so the
- *    absence timer is suppressed and only (re)armed after the read completes.
- *    This prevents a busy reader (not emitting CARD_PRESENT while servicing our
- *    SCAN/READ commands) from being mistaken for an absent card and causing a
- *    spurious duplicate auto-read of the same, never-removed card.
+ * v0.2 model (firmware controls cadence via RESCAN):
+ *  - When enabled, trigger a read on EACH received CARD_PRESENT event.
+ *  - There is no same-UID suppression anymore — the firmware's RESCAN interval
+ *    governs how often CARD_PRESENT (and thus auto-read) repeats. The UID is
+ *    still tracked for display purposes only.
+ *  - Reads are guarded by an `inFlight` flag so an event arriving while a read
+ *    is still running does not start an overlapping read (it is dropped).
+ *  - The read is TYPE-AWARE: scan() first to learn the card type, then:
+ *      CLASSIC    -> readBlock(addr, key)
+ *      ULTRALIGHT -> readPage(addr)
+ *      ISO4/UNKNOWN -> nothing further (UID/type only)
  *
  * It NEVER triggers a write.
  */
 export class AutoReader {
   private deps: AutoReadDeps;
+  /** Last UID seen (display/tracking only; not used for suppression). */
   private lastUid: string | null = null;
-  private absenceTimer: ReturnType<typeof setTimeout> | null = null;
-  /** True while a scan+read sequence is actively running. While in-flight the
-   *  card is, by definition, present — so the absence reset must not fire. */
+  /** True while a scan(+read) sequence is actively running. Guards overlap. */
   private inFlight = false;
-  /** Injectable clock for testability of the debounce timer (defaults to setTimeout). */
-  private scheduleReset: (cb: () => void) => ReturnType<typeof setTimeout>;
 
-  constructor(
-    deps: AutoReadDeps,
-    scheduleReset?: (cb: () => void) => ReturnType<typeof setTimeout>,
-  ) {
+  constructor(deps: AutoReadDeps) {
     this.deps = deps;
-    this.scheduleReset =
-      scheduleReset ?? ((cb) => setTimeout(cb, ABSENCE_RESET_MS));
   }
 
   /** Parse a raw line and, if it is a CARD_PRESENT event, handle it. */
@@ -71,78 +53,52 @@ export class AutoReader {
     this.handleCardPresent(uid);
   }
 
-  /** Handle a CARD_PRESENT for a specific UID (debounced). */
+  /** Handle a CARD_PRESENT for a specific UID. Reads once per event when
+   *  enabled and not already reading. */
   handleCardPresent(uid: string): void {
-    // Any CARD_PRESENT cancels the pending absence reset.
-    this.clearAbsenceTimer();
-
-    if (this.deps.isEnabled() && uid !== this.lastUid) {
-      this.lastUid = uid;
-      void this.runAutoRead();
-      // Do NOT arm the absence timer here: runAutoRead is now in-flight and
-      // will (re)arm it in its finally once the read completes.
-      return;
-    }
-
-    if (this.deps.isEnabled()) {
-      // Same UID: remember it so we don't re-trigger.
-      this.lastUid = uid;
-    }
-
-    // (Re)arm the absence reset only when no auto-read is in flight. While
-    // in-flight the card is present by definition, so we must not treat a gap
-    // in CARD_PRESENT events (the reader is busy servicing our commands) as
-    // the card being absent.
-    this.armAbsenceTimer();
+    this.lastUid = uid; // track for display only
+    if (!this.deps.isEnabled()) return;
+    if (this.inFlight) return; // guard against overlapping reads
+    void this.runAutoRead();
   }
 
-  /** Reset all debounce state (e.g. on disconnect). */
+  /** Last UID seen (display/tracking only). */
+  getLastUid(): string | null {
+    return this.lastUid;
+  }
+
+  /** Reset state (e.g. on disconnect). */
   reset(): void {
-    this.clearAbsenceTimer();
     this.lastUid = null;
     this.inFlight = false;
   }
 
-  private clearAbsenceTimer(): void {
-    if (this.absenceTimer !== null) {
-      clearTimeout(this.absenceTimer);
-      this.absenceTimer = null;
-    }
-  }
-
-  /** Arm the idle-absence timer, but never while a read is in flight. */
-  private armAbsenceTimer(): void {
-    if (this.inFlight) return;
-    this.clearAbsenceTimer();
-    this.absenceTimer = this.scheduleReset(() => {
-      this.absenceTimer = null;
-      // Guard: if a read started in the meantime, don't clear — re-arm later.
-      if (this.inFlight) return;
-      this.lastUid = null;
-    });
-  }
-
   private async runAutoRead(): Promise<void> {
-    const { controller, getBlock, getKey, onResult, onLog } = this.deps;
-    const block = getBlock();
-    const key = cleanHex(getKey());
+    const { controller, getBlock, getKey, getPage, onResult, onLog } = this.deps;
 
     this.inFlight = true;
-    // Cancel any absence timer that may have been armed before this read began,
-    // so it cannot fire mid-read and clear lastUid.
-    this.clearAbsenceTimer();
     try {
       onLog?.('SCAN');
       const scanResult = await controller.scan();
       onResult(scanResult);
 
-      onLog?.(`READ_BLOCK ${block} ${key}`.trim());
-      const readResult = await controller.readBlock(block, key || undefined);
-      onResult(readResult);
+      const family: CardFamily | undefined = scanResult.card?.family;
+
+      if (family === 'CLASSIC') {
+        const block = getBlock();
+        const key = cleanHex(getKey());
+        onLog?.(`READ_BLOCK ${block} ${key}`.trim());
+        const readResult = await controller.readBlock(block, key || undefined);
+        onResult(readResult);
+      } else if (family === 'ULTRALIGHT') {
+        const page = getPage();
+        onLog?.(`READ_PAGE ${page}`);
+        const readResult = await controller.readPage(page);
+        onResult(readResult);
+      }
+      // ISO4 / UNKNOWN: UID/type only — no block/page read.
     } finally {
       this.inFlight = false;
-      // Now that the read is done, start counting idle time toward absence.
-      this.armAbsenceTimer();
     }
   }
 }

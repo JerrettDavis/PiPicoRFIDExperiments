@@ -1,9 +1,10 @@
 import type { SerialTransport } from './serial/transport.js';
 import type { OpResult, CardInfo, BlockResult } from './types.js';
 import {
-  parseLine,
+  parseLine, parseScanPayload,
   buildPing, buildVersion, buildHelp, buildScan,
   buildReadBlock, buildWriteBlock, buildDump,
+  buildReadPage, buildWritePage, buildRescan, buildRescanQuery,
   cleanHex, sectorRange,
 } from './protocol.js';
 
@@ -80,24 +81,27 @@ export class RfidController {
   private buildResult(ok: boolean, raw: string, payload: string): OpResult {
     if (!ok) return { ok: false, raw, error: payload };
 
-    // Parse UID response: UID=DEADBEEF SAK=0x08 TYPE=MIFARE_1K
-    if (payload.includes('UID=') && payload.includes('SAK=')) {
-      const uid = payload.match(/UID=([^\s]+)/)?.[1] ?? '';
-      const sak = payload.match(/SAK=([^\s]+)/)?.[1] ?? '';
-      const type = payload.match(/TYPE=([^\s]+)/)?.[1] ?? '';
-      const card: CardInfo = { uid, sak, type };
+    // Parse SCAN/UID response (v0.2, by key): UID=.. SIZE=.. SAK=.. TYPE=..
+    const card = parseScanPayload(payload);
+    if (card) {
       return { ok: true, raw, card };
     }
 
-    // Parse BLOCK response: BLOCK=4 DATA=...
-    if (payload.includes('BLOCK=') && payload.includes('DATA=')) {
-      const block = parseInt(payload.match(/BLOCK=(\d+)/)?.[1] ?? '0', 10);
-      const data = payload.match(/DATA=([0-9A-Fa-f]+)/)?.[1] ?? '';
-      return { ok: true, raw, block: { block, data } };
+    // Parse RESCAN response: RESCAN <ms>
+    const rescanMatch = payload.match(/^RESCAN\s+(\d+)/);
+    if (rescanMatch) {
+      return { ok: true, raw, rescan: parseInt(rescanMatch[1]!, 10) };
     }
 
-    // Parse WROTE response: WROTE BLOCK=4 DATA=...
-    if (payload.startsWith('WROTE') && payload.includes('BLOCK=')) {
+    // Parse PAGE response: PAGE=4 DATA=...  (and WROTE_PAGE PAGE=4 DATA=...)
+    if (payload.includes('PAGE=') && payload.includes('DATA=')) {
+      const page = parseInt(payload.match(/PAGE=(\d+)/)?.[1] ?? '0', 10);
+      const data = payload.match(/DATA=([0-9A-Fa-f]+)/)?.[1] ?? '';
+      return { ok: true, raw, page: { page, data } };
+    }
+
+    // Parse BLOCK response: BLOCK=4 DATA=... (and WROTE BLOCK=4 DATA=...)
+    if (payload.includes('BLOCK=') && payload.includes('DATA=')) {
       const block = parseInt(payload.match(/BLOCK=(\d+)/)?.[1] ?? '0', 10);
       const data = payload.match(/DATA=([0-9A-Fa-f]+)/)?.[1] ?? '';
       return { ok: true, raw, block: { block, data } };
@@ -127,7 +131,9 @@ export class RfidController {
     }
 
     if (hasError) return { ok: false, raw: lines.join('\n'), error: errorMsg };
-    const card: CardInfo | undefined = uid ? { uid, sak: '', type: '' } : undefined;
+    const card: CardInfo | undefined = uid
+      ? { uid, size: 0, sak: '', type: 'UNKNOWN', family: 'UNKNOWN' }
+      : undefined;
     return { ok: true, raw: lines.join('\n'), card, blocks };
   }
 
@@ -202,5 +208,25 @@ export class RfidController {
     const { start, end } = sectorRange(block);
     const k = key ? cleanHex(key) : undefined;
     return this.sendCommand(buildDump(start, end, k), true);
+  }
+
+  // ── v0.2: Ultralight/NTAG page ops ──────────────────────────────────────────
+
+  async readPage(page: number): Promise<OpResult> {
+    return this.sendCommand(buildReadPage(page));
+  }
+
+  async writePage(page: number, hex: string): Promise<OpResult> {
+    return this.sendCommand(buildWritePage(page, cleanHex(hex)));
+  }
+
+  // ── v0.2: configurable re-scan interval ──────────────────────────────────────
+
+  async rescan(ms: number): Promise<OpResult> {
+    return this.sendCommand(buildRescan(ms));
+  }
+
+  async rescanQuery(): Promise<OpResult> {
+    return this.sendCommand(buildRescanQuery());
   }
 }

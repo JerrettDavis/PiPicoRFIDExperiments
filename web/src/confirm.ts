@@ -1,10 +1,15 @@
 interface ConfirmWriteOptions {
+  /** Target address (block number for CLASSIC, page number for ULTRALIGHT). */
   block: number;
   data: string;
   key: string;
+  /** Address unit label; defaults to 'block'. */
+  unit?: 'block' | 'page';
 }
 
 export async function confirmWrite(opts: ConfirmWriteOptions): Promise<boolean> {
+  const unit = opts.unit ?? 'block';
+  const hexLen = opts.data.length;
   return new Promise<boolean>((resolve) => {
     // Create overlay
     const overlay = document.createElement('div');
@@ -51,14 +56,14 @@ export async function confirmWrite(opts: ConfirmWriteOptions): Promise<boolean> 
       const blockLine = document.createElement('p');
       blockLine.style.cssText = 'margin: 0 0 8px;';
       const blockLabel = document.createElement('strong');
-      blockLabel.textContent = 'Target block:';
+      blockLabel.textContent = `Target ${unit}:`;
       blockLine.appendChild(blockLabel);
       blockLine.append(` ${opts.block}`);
 
       const dataLabel = document.createElement('p');
       dataLabel.style.cssText = 'margin: 0 0 8px;';
       const dataLabelStrong = document.createElement('strong');
-      dataLabelStrong.textContent = 'Data (32 hex):';
+      dataLabelStrong.textContent = `Data (${hexLen} hex):`;
       dataLabel.appendChild(dataLabelStrong);
 
       const dataCode = document.createElement('code');
@@ -67,7 +72,7 @@ export async function confirmWrite(opts: ConfirmWriteOptions): Promise<boolean> 
 
       const warning = document.createElement('p');
       warning.style.cssText = 'margin: 12px 0 0; color: var(--danger); font-weight: 600;';
-      warning.textContent = `⚠ This will permanently overwrite block ${opts.block}. This cannot be undone.`;
+      warning.textContent = `⚠ This will permanently overwrite ${unit} ${opts.block}. This cannot be undone.`;
 
       info.appendChild(blockLine);
       info.appendChild(dataLabel);
@@ -83,7 +88,7 @@ export async function confirmWrite(opts: ConfirmWriteOptions): Promise<boolean> 
       ackCheckbox.style.cssText = 'margin-top: 2px; width: auto; flex-shrink: 0;';
 
       const ackText = document.createElement('span');
-      ackText.textContent = `I understand this overwrites block ${opts.block}`;
+      ackText.textContent = `I understand this overwrites ${unit} ${opts.block}`;
 
       ackLabel.appendChild(ackCheckbox);
       ackLabel.appendChild(ackText);

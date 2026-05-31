@@ -1,8 +1,8 @@
 import './style.css';
 import { createTransport } from './serial/transport.js';
-import { MockSerialTransport } from './serial/mockPico.js';
+import { MockSerialTransport, type MockCardKind } from './serial/mockPico.js';
 import { RfidController } from './controller.js';
-import { cleanHex } from './protocol.js';
+import { cleanHex, trailerForBlock } from './protocol.js';
 import { confirmWrite } from './confirm.js';
 import { AutoReader } from './autoread.js';
 import {
@@ -12,6 +12,8 @@ import {
   renderAutoReadState,
   renderWriteError,
   clearWriteError,
+  renderPageWriteError,
+  clearPageWriteError,
   appendLog,
   clearLog,
   getConnectBtn,
@@ -19,13 +21,17 @@ import {
   getBlockInput,
   getKeyInput,
   getDataInput,
+  getPageInput,
+  getPageDataInput,
+  getRescanInput,
   getRawInput,
   getAutoReadToggle,
 } from './ui.js';
 
 declare global {
   interface Window {
-    __mockEmitCardPresent?: (uid: string) => void;
+    __mockEmitCardPresent?: (uid?: string) => void;
+    __mockSetCard?: (kind: MockCardKind) => void;
   }
 }
 
@@ -41,6 +47,7 @@ const autoReader = new AutoReader({
   isEnabled: () => getAutoReadToggle().checked,
   getBlock: () => parseInt(getBlockInput().value, 10),
   getKey: () => getKeyInput().value,
+  getPage: () => parseInt(getPageInput().value, 10),
   onResult: (result) => renderOpResult(result),
   onLog: (line) => appendLog(line, 'tx'),
 });
@@ -57,7 +64,12 @@ autoReadToggle.addEventListener('change', () => {
 transport.onStatus(connected => {
   renderStatus(connected);
   appendLog(connected ? 'Connected' : 'Disconnected');
-  if (!connected) autoReader.reset();
+  if (connected) {
+    // Push the current re-scan interval to the firmware on connect.
+    void applyRescan();
+  } else {
+    autoReader.reset();
+  }
 });
 
 transport.onLine(line => {
@@ -69,12 +81,30 @@ controller.onEvent(line => {
   autoReader.handleLine(line);
 });
 
-// ── Mock-only test hook for injecting CARD_PRESENT events ─────────────────────
+// ── Mock-only test hooks ──────────────────────────────────────────────────────
 
 if (transport instanceof MockSerialTransport) {
   const mock = transport;
-  window.__mockEmitCardPresent = (uid: string) => mock.emitCardPresent(uid);
+  window.__mockEmitCardPresent = (uid?: string) => mock.emitCardPresent(uid);
+  window.__mockSetCard = (kind: MockCardKind) => mock.setCard(kind);
 }
+
+// ── Re-scan interval control ──────────────────────────────────────────────────
+
+async function applyRescan(): Promise<void> {
+  const raw = getRescanInput().value.trim();
+  const ms = Math.max(0, parseInt(raw || '0', 10) || 0);
+  appendLog(`RESCAN ${ms}`, 'tx');
+  const result = await controller.rescan(ms);
+  if (result.ok && result.rescan !== undefined) {
+    appendLog(`Re-scan interval set to ${result.rescan} ms`);
+  }
+  renderOpResult(result);
+}
+
+document.getElementById('rescanApply')?.addEventListener('click', () => {
+  applyRescan().catch(err => appendLog(String(err)));
+});
 
 // ── Connection buttons ────────────────────────────────────────────────────────
 
@@ -130,7 +160,7 @@ async function doWrite(block: number, hex: string, key: string): Promise<void> {
     renderWriteError('Block 0 is protected (UID/manufacturer data).');
     return;
   }
-  if (block % 4 === 3) {
+  if (trailerForBlock(block) === block) {
     renderWriteError(`Block ${block} is a sector trailer — writes refused.`);
     return;
   }
@@ -155,6 +185,41 @@ document.getElementById('writeBlock')?.addEventListener('click', async () => {
   await doWrite(block, hex, key);
 });
 
+// ── Ultralight page read / write ──────────────────────────────────────────────
+
+document.getElementById('readPage')?.addEventListener('click', async () => {
+  const page = parseInt(getPageInput().value, 10);
+  appendLog(`READ_PAGE ${page}`, 'tx');
+  const result = await controller.readPage(page);
+  renderOpResult(result);
+});
+
+// WRITE_PAGE goes through the SAME two-step confirmation as WRITE_BLOCK.
+async function doWritePage(page: number, hex: string): Promise<void> {
+  if (page <= 3) {
+    renderPageWriteError(`Page ${page} is protected (pages 0–3) — writes refused.`);
+    return;
+  }
+  if (hex.length !== 8) {
+    renderPageWriteError(`Data must be exactly 8 hex chars / 4 bytes (got ${hex.length}).`);
+    return;
+  }
+  clearPageWriteError();
+
+  const confirmed = await confirmWrite({ block: page, data: hex, key: '', unit: 'page' });
+  if (!confirmed) return;
+
+  appendLog(`WRITE_PAGE ${page} ${hex}`, 'tx');
+  const result = await controller.writePage(page, hex);
+  renderOpResult(result);
+}
+
+document.getElementById('writePage')?.addEventListener('click', async () => {
+  const page = parseInt(getPageInput().value, 10);
+  const hex = cleanHex(getPageDataInput().value);
+  await doWritePage(page, hex);
+});
+
 // ── Raw command (intercepts WRITE_BLOCK) ─────────────────────────────────────
 
 async function sendRaw(raw: string): Promise<void> {
@@ -170,8 +235,35 @@ async function sendRaw(raw: string): Promise<void> {
     await doWrite(block, hex, key);
     return;
   }
+  if (upper.startsWith('WRITE_PAGE')) {
+    const parts = trimmed.split(/\s+/);
+    const page = parseInt(parts[1] ?? '0', 10);
+    const hex = cleanHex(parts[2] ?? '');
+    await doWritePage(page, hex);
+    return;
+  }
 
+  // Route known read/scan commands through the controller so their result —
+  // including ERR (WRONG_CARD_TYPE / UNSUPPORTED_CARD / REFUSE_PAGE) — is
+  // surfaced cleanly in the card panel + badge, not just logged.
+  const parts = trimmed.split(/\s+/);
   appendLog(trimmed, 'tx');
+  if (upper.startsWith('READ_BLOCK')) {
+    const block = parseInt(parts[1] ?? '0', 10);
+    const key = cleanHex(parts[2] ?? '');
+    renderOpResult(await controller.readBlock(block, key || undefined));
+    return;
+  }
+  if (upper.startsWith('READ_PAGE')) {
+    const pageNum = parseInt(parts[1] ?? '0', 10);
+    renderOpResult(await controller.readPage(pageNum));
+    return;
+  }
+  if (upper === 'SCAN' || upper === 'UID' || upper === 'READ_UID') {
+    renderOpResult(await controller.scan());
+    return;
+  }
+
   await transport.send(trimmed);
 }
 

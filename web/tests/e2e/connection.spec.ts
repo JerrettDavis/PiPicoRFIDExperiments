@@ -13,7 +13,7 @@ test('Connect sets status to Connected with connected dot', async ({ page }) => 
 test('Boot banner READY and CARD_PRESENT UID appear in log; Scan shows UID in card panel', async ({ page }) => {
   await page.getByTestId('btn-connect').click();
   const log = page.getByTestId('log');
-  await expect(log).toContainText('READY RP2040_RFID_USB 0.1.0', { timeout: 3000 });
+  await expect(log).toContainText('READY RP2040_RFID_USB 0.2.0', { timeout: 3000 });
   await expect(log).toContainText('EVENT CARD_PRESENT UID=DEADBEEF', { timeout: 3000 });
 
   // Scan and check card panel
