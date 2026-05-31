@@ -165,3 +165,42 @@ test('Raw WRITE_BLOCK completing both steps sends it and OK WROTE appears', asyn
 
   await expect(page.getByTestId('log')).toContainText('OK WROTE BLOCK=4', { timeout: 3000 });
 });
+
+// ── v0.3 regression: single-write invariant unchanged by the clone feature ────
+
+test('Single WRITE_BLOCK still opens write-confirm-modal (NOT clone-confirm-modal)', async ({ page }) => {
+  await page.getByTestId('input-block').fill('4');
+  await page.getByTestId('input-data').fill(NEW_DATA);
+  await page.getByTestId('btn-write').click();
+
+  // The single-write two-step modal opens; the clone modal must NOT.
+  await expect(page.getByTestId('write-confirm-modal')).toBeVisible({ timeout: 2000 });
+  await expect(page.getByTestId('clone-confirm-modal')).not.toBeVisible();
+
+  // Step 1 still uses confirm-ack/confirm-step1; step 2 types the block number.
+  await page.getByTestId('confirm-ack').check();
+  await page.getByTestId('confirm-step1').click();
+  await expect(page.getByTestId('write-confirm-step2')).toBeVisible({ timeout: 2000 });
+  // Step 2 stays disabled until the exact block number is typed.
+  await expect(page.getByTestId('confirm-step2')).toBeDisabled();
+  await page.getByTestId('confirm-type').fill('4');
+  await expect(page.getByTestId('confirm-step2')).toBeEnabled();
+  await page.getByTestId('confirm-step2').click();
+  await expect(page.getByTestId('log')).toContainText('OK WROTE BLOCK=4', { timeout: 3000 });
+});
+
+test('Raw bulk-destructive commands are refused (no confirmClone bypass)', async ({ page }) => {
+  for (const cmd of [
+    'WRITE_BLOCK_RAW 4 AABBCCDD11223344AABBCCDD11223344 KEY=FFFFFFFFFFFF',
+    'WRITE_TRAILER 7 FFFFFFFFFFFFFF078069FFFFFFFFFFFF KEY=FFFFFFFFFFFF',
+    'CLONE_UID DEADBEEF5508000000000000000000000 METHOD=GEN2',
+  ]) {
+    await page.getByTestId('input-raw').fill(cmd);
+    await page.getByTestId('btn-send-raw').click();
+    await expect(page.getByTestId('write-error')).toContainText('Clone panel', { timeout: 2000 });
+    // Neither confirm modal opened, and nothing was written.
+    await expect(page.getByTestId('write-confirm-modal')).not.toBeVisible();
+    await expect(page.getByTestId('clone-confirm-modal')).not.toBeVisible();
+    await expect(page.getByTestId('log')).not.toContainText('OK WROTE');
+  }
+});

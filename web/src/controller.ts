@@ -2,20 +2,31 @@ import type { SerialTransport } from './serial/transport.js';
 import type { OpResult, CardInfo, BlockResult } from './types.js';
 import {
   parseLine, parseScanPayload,
+  parseCloneStream, parseMagic, parseAts, parseApdu,
   buildPing, buildVersion, buildHelp, buildScan,
   buildReadBlock, buildWriteBlock, buildDump,
   buildReadPage, buildWritePage, buildRescan, buildRescanQuery,
+  buildCloneRead, buildCloneReadUl, buildMagicDetect, buildCloneUid,
+  buildWriteBlockRaw, buildWriteTrailer, buildWritePageRaw, buildAts, buildApdu,
   cleanHex, sectorRange,
 } from './protocol.js';
 
 const TIMEOUT_MS = 3000;
+/** Clone reads (full 4K dumps) can far exceed the default per-command timeout. */
+const CLONE_TIMEOUT_MS = 30000;
 
 type EventCallback = (line: string) => void;
+
+/** Returns true when the given OK payload is the terminal line of a stream. */
+type StreamEnd = (payload: string) => boolean;
 
 interface Pending {
   resolve: (result: OpResult) => void;
   lines: string[];
-  isDump: boolean;
+  /** When set, the request streams lines until this returns true for an OK line. */
+  streamEnd?: StreamEnd;
+  /** Builds the OpResult from the accumulated stream lines. */
+  buildStream?: (lines: string[]) => OpResult;
 }
 
 export class RfidController {
@@ -41,28 +52,28 @@ export class RfidController {
   private handleLine(line: string): void {
     const parsed = parseLine(line);
 
-    // Route unsolicited lines
-    if (parsed.kind === 'event' || parsed.kind === 'banner') {
-      this.emitEvent(line);
-      return;
-    }
-
-    if (!this.pending) {
-      // No in-flight request; emit as event anyway for logging
+    // Genuine unsolicited events (EVENT CARD_PRESENT) are ALWAYS routed to the
+    // event callback, even mid-stream, so auto-read keeps working.
+    if (parsed.kind === 'event') {
       this.emitEvent(line);
       return;
     }
 
     const p = this.pending;
 
-    if (p.isDump) {
+    // Generalized streaming request (DUMP, CLONE_READ, CLONE_READ_UL).
+    // While a stream is in flight, ALL non-event lines (SECTOR=, BLOCK=, PAGE=,
+    // banner-shaped intermediate lines, and the terminal OK ..._END) belong to
+    // the stream, not the unsolicited-event path.
+    if (p && p.streamEnd) {
       p.lines.push(line);
-      // Terminal line for DUMP
-      if (parsed.kind === 'ok' && parsed.payload.startsWith('DUMP_END')) {
+      if (parsed.kind === 'ok' && p.streamEnd(parsed.payload)) {
         this.pending = null;
-        p.resolve(this.buildDumpResult(p.lines));
+        const build = p.buildStream ?? ((ls) => this.buildDumpResult(ls));
+        p.resolve(build(p.lines));
         this.drainQueue();
       } else if (parsed.kind === 'err') {
+        // A top-level ERR (e.g. CLONE_UNSUPPORTED) terminates the stream.
         this.pending = null;
         p.resolve({ ok: false, raw: line, error: parsed.payload });
         this.drainQueue();
@@ -70,7 +81,19 @@ export class RfidController {
       return;
     }
 
-    // Non-dump: first ok/err terminates
+    // Non-streaming: route banners (READY/PINS) and idle lines to events.
+    if (parsed.kind === 'banner') {
+      this.emitEvent(line);
+      return;
+    }
+
+    if (!p) {
+      // No in-flight request; emit as event anyway for logging
+      this.emitEvent(line);
+      return;
+    }
+
+    // Non-streaming: first ok/err terminates
     if (parsed.kind === 'ok' || parsed.kind === 'err') {
       this.pending = null;
       p.resolve(this.buildResult(parsed.kind === 'ok', line, parsed.payload));
@@ -91,6 +114,23 @@ export class RfidController {
     const rescanMatch = payload.match(/^RESCAN\s+(\d+)/);
     if (rescanMatch) {
       return { ok: true, raw, rescan: parseInt(rescanMatch[1]!, 10) };
+    }
+
+    // v0.3 scalar responses.
+    if (payload.startsWith('MAGIC ')) {
+      return { ok: true, raw, magic: parseMagic(payload) };
+    }
+    if (payload.startsWith('ATS=')) {
+      return { ok: true, raw, ats: parseAts(payload) };
+    }
+    if (payload.startsWith('APDU ')) {
+      return { ok: true, raw, apdu: parseApdu(payload) };
+    }
+    // CLONE_UID: `CLONE_UID METHOD=<GEN1A|GEN2> UID=<hex>` — surface card UID.
+    if (payload.startsWith('CLONE_UID ')) {
+      const uid = payload.match(/\bUID=(\S+)/)?.[1] ?? '';
+      const card: CardInfo = { uid, size: 0, sak: '', type: 'UNKNOWN', family: 'UNKNOWN' };
+      return { ok: true, raw, card };
     }
 
     // Parse PAGE response: PAGE=4 DATA=...  (and WROTE_PAGE PAGE=4 DATA=...)
@@ -142,7 +182,15 @@ export class RfidController {
     if (next) next();
   }
 
-  private sendCommand(cmd: string, isDump = false): Promise<OpResult> {
+  private sendCommand(
+    cmd: string,
+    opts: {
+      streamEnd?: StreamEnd;
+      buildStream?: (lines: string[]) => OpResult;
+      timeoutMs?: number;
+    } = {},
+  ): Promise<OpResult> {
+    const timeoutMs = opts.timeoutMs ?? TIMEOUT_MS;
     return new Promise<OpResult>((outerResolve) => {
       const execute = () => {
         const timer = setTimeout(() => {
@@ -151,16 +199,18 @@ export class RfidController {
             outerResolve({ ok: false, raw: '', error: 'TIMEOUT' });
             this.drainQueue();
           }
-        }, TIMEOUT_MS);
+        }, timeoutMs);
 
-        this.pending = {
+        const pending: Pending = {
           resolve: (result) => {
             clearTimeout(timer);
             outerResolve(result);
           },
           lines: [],
-          isDump,
         };
+        if (opts.streamEnd) pending.streamEnd = opts.streamEnd;
+        if (opts.buildStream) pending.buildStream = opts.buildStream;
+        this.pending = pending;
 
         this.transport.send(cmd).catch(err => {
           clearTimeout(timer);
@@ -207,7 +257,10 @@ export class RfidController {
   async dump(block: number, key?: string): Promise<OpResult> {
     const { start, end } = sectorRange(block);
     const k = key ? cleanHex(key) : undefined;
-    return this.sendCommand(buildDump(start, end, k), true);
+    return this.sendCommand(buildDump(start, end, k), {
+      streamEnd: (payload) => payload.startsWith('DUMP_END'),
+      buildStream: (lines) => this.buildDumpResult(lines),
+    });
   }
 
   // ── v0.2: Ultralight/NTAG page ops ──────────────────────────────────────────
@@ -228,5 +281,58 @@ export class RfidController {
 
   async rescanQuery(): Promise<OpResult> {
     return this.sendCommand(buildRescanQuery());
+  }
+
+  // ── v0.3: clone workflow ─────────────────────────────────────────────────────
+
+  /**
+   * Read a full source image. Classic streams CLONE_BEGIN..CLONE_END; Ultralight
+   * streams ULDUMP_BEGIN..ULDUMP_END. Uses an extended 30s timeout because 4K
+   * dumps far exceed the 3s default. ISO4 → ERR CLONE_UNSUPPORTED.
+   */
+  async cloneRead(): Promise<OpResult> {
+    return this.sendCommand(buildCloneRead(), {
+      streamEnd: (payload) =>
+        payload.startsWith('CLONE_END') || payload.startsWith('ULDUMP_END'),
+      buildStream: (lines) => ({ ok: true, raw: lines.join('\n'), image: parseCloneStream(lines) }),
+      timeoutMs: CLONE_TIMEOUT_MS,
+    });
+  }
+
+  /** Explicit Ultralight image read (ULDUMP framing). */
+  async cloneReadUl(): Promise<OpResult> {
+    return this.sendCommand(buildCloneReadUl(), {
+      streamEnd: (payload) => payload.startsWith('ULDUMP_END'),
+      buildStream: (lines) => ({ ok: true, raw: lines.join('\n'), image: parseCloneStream(lines) }),
+      timeoutMs: CLONE_TIMEOUT_MS,
+    });
+  }
+
+  async magicDetect(): Promise<OpResult> {
+    return this.sendCommand(buildMagicDetect());
+  }
+
+  async cloneUid(block0: string, method: string): Promise<OpResult> {
+    return this.sendCommand(buildCloneUid(block0, method));
+  }
+
+  async writeBlockRaw(block: number, hex: string, key: string): Promise<OpResult> {
+    return this.sendCommand(buildWriteBlockRaw(block, hex, key));
+  }
+
+  async writeTrailer(trailerBlock: number, hex: string, key: string): Promise<OpResult> {
+    return this.sendCommand(buildWriteTrailer(trailerBlock, hex, key));
+  }
+
+  async writePageRaw(page: number, hex: string): Promise<OpResult> {
+    return this.sendCommand(buildWritePageRaw(page, hex));
+  }
+
+  async ats(): Promise<OpResult> {
+    return this.sendCommand(buildAts());
+  }
+
+  async apdu(hex: string): Promise<OpResult> {
+    return this.sendCommand(buildApdu(hex));
   }
 }

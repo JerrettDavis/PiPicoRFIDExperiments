@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include <MFRC522Extended.h>  // v0.3: RATS/T=CL + inherited magic-UID helpers
 
 // Wiring: RC522 <-> Raspberry Pi Pico / RP2040
 // 3.3V -> 3V3 OUT
@@ -19,13 +20,20 @@ static constexpr uint8_t PIN_SPI_MOSI = 19;
 static constexpr uint8_t PIN_RFID_RST = 20;
 static constexpr uint8_t PIN_RFID_IRQ = 21;
 
-MFRC522 rfid(PIN_RFID_SS, PIN_RFID_RST);
+// v0.3: MFRC522Extended is a drop-in subclass of MFRC522 — all existing
+// MFRC522:: enums/constants and Classic/Ultralight calls keep working, and we
+// additionally gain PICC_RequestATS / TCL_Transceive / MIFARE_OpenUidBackdoor /
+// MIFARE_SetUid.
+MFRC522Extended rfid(PIN_RFID_SS, PIN_RFID_RST);
 MFRC522::MIFARE_Key defaultKey;
 
 String inputLine;
 String lastUid;
 unsigned long lastPollMs = 0;
 bool cardPresent = false;
+
+// v0.3: ATQA captured during selectCard(), surfaced by SCAN.
+uint16_t lastAtqa = 0;
 
 // RESCAN: while the SAME card stays continuously present, re-emit
 // EVENT CARD_PRESENT every rescanIntervalMs (0 = disabled, emit once per
@@ -151,7 +159,7 @@ static String currentUidHex() {
 }
 
 static void emitReady() {
-  Serial.println("READY RP2040_RFID_USB 0.2.0");
+  Serial.println("READY RP2040_RFID_USB 0.3.0");
   Serial.println("PINS SS=17 SCK=18 MOSI=19 MISO=16 RST=20 IRQ=21");
   Serial.println("TYPE HELP");
 }
@@ -167,17 +175,39 @@ static void printHelp() {
   Serial.println("  DUMP <startBlock> <endBlock> [keyAhex12]");
   Serial.println("  READ_PAGE <page>");
   Serial.println("  WRITE_PAGE <page> <hex8>");
+  Serial.println("  CLONE_READ");
+  Serial.println("  CLONE_READ_UL");
+  Serial.println("  MAGIC_DETECT");
+  Serial.println("  CLONE_UID <block0hex32> METHOD=<GEN1A|GEN2|AUTO>");
+  Serial.println("  WRITE_BLOCK_RAW <block> <hex32> KEY=<hex12>");
+  Serial.println("  WRITE_TRAILER <trailerBlock> <hex32> KEY=<hex12>");
+  Serial.println("  WRITE_PAGE_RAW <page> <hex8>");
+  Serial.println("  ATS");
+  Serial.println("  APDU <hexCAPDU>");
   Serial.println("NOTES");
   Serial.println("  Default key is FFFFFFFFFFFF");
   Serial.println("  WRITE_BLOCK refuses block 0 and sector trailer blocks for safety");
   Serial.println("  RESCAN <ms>: re-emit EVENT CARD_PRESENT every ms while same card present (0=off)");
   Serial.println("  READ_PAGE/WRITE_PAGE target Ultralight/NTAG (no auth); WRITE_PAGE refuses pages 0-3");
+  Serial.println("  CLONE_READ dumps all readable sectors using a built-in key dictionary");
+  Serial.println("  MAGIC_DETECT/CLONE_UID need magic (Gen1a/Gen2) cards; normal UIDs are unchangeable");
+  Serial.println("  WRITE_PAGE_RAW allows pages 0-2 (magic NTAG); refuses page 3 OTP and cascade byte");
+  Serial.println("  ATS/APDU target ISO-14443-4 cards; APDU req/resp limited to 60 bytes");
 }
 
 static bool selectCard() {
-  // First try the normal path.
+  // First try the normal path. PICC_IsNewCardPresent() issues REQA but does not
+  // expose the ATQA, so on success we follow up with a WUPA to capture ATQA for
+  // the SCAN response. WUPA also re-selects the same card harmlessly.
   if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-    return true;
+    byte atqa[2];
+    byte atqaSize = sizeof(atqa);
+    MFRC522::StatusCode w = rfid.PICC_WakeupA(atqa, &atqaSize);
+    if (w == MFRC522::STATUS_OK || w == MFRC522::STATUS_COLLISION) {
+      lastAtqa = (uint16_t)atqa[0] | ((uint16_t)atqa[1] << 8);
+      return rfid.PICC_ReadCardSerial();
+    }
+    return true;  // selected, but ATQA capture failed; keep prior lastAtqa
   }
 
   // Then try waking an already-present card. This helps when repeatedly clicking
@@ -186,6 +216,7 @@ static bool selectCard() {
   byte atqaSize = sizeof(atqa);
   MFRC522::StatusCode wake = rfid.PICC_WakeupA(atqa, &atqaSize);
   if (wake == MFRC522::STATUS_OK || wake == MFRC522::STATUS_COLLISION) {
+    lastAtqa = (uint16_t)atqa[0] | ((uint16_t)atqa[1] << 8);
     return rfid.PICC_ReadCardSerial();
   }
 
@@ -291,6 +322,111 @@ static bool authenticateBlock(byte block, const String& keyHex) {
   return true;
 }
 
+// ============================================================================
+// v0.3 cloning primitives — helpers
+// ============================================================================
+
+// Common MIFARE Classic keys, tried as both Key A and Key B per sector.
+static const char* const KEY_DICT[] = {
+  "FFFFFFFFFFFF", "000000000000", "A0A1A2A3A4A5", "B0B1B2B3B4B5",
+  "D3F7D3F7D3F7", "4D3A99C351DD", "1A982C7E459A", "AABBCCDDEEFF",
+  "714C5C886E97", "587EE5F9350F", "A396EFA4E24F"
+};
+static const uint8_t KEY_DICT_COUNT = sizeof(KEY_DICT) / sizeof(KEY_DICT[0]);
+
+static byte sectorCount(MFRC522::PICC_Type type) {
+  switch (type) {
+    case MFRC522::PICC_TYPE_MIFARE_MINI: return 5;
+    case MFRC522::PICC_TYPE_MIFARE_1K:   return 16;
+    case MFRC522::PICC_TYPE_MIFARE_4K:   return 40;
+    default:                             return 0;
+  }
+}
+
+static byte firstBlockOfSector(byte sector) {
+  if (sector < 32) return sector * 4;
+  return 128 + (sector - 32) * 16;
+}
+
+static byte blocksInSector(byte sector) {
+  return (sector < 32) ? 4 : 16;
+}
+
+static byte bccClassic(const byte* uid4) {
+  return uid4[0] ^ uid4[1] ^ uid4[2] ^ uid4[3];
+}
+
+// Try every dictionary key (Key A then Key B) authenticating against a sector's
+// TRAILER block. On success, crypto is left OPEN (caller must StopCrypto1 when
+// done) and the matching key hex + type ('A'/'B') are returned via out params.
+static bool authSectorWithDict(byte sector, String& outKeyHex, char& outKeyType) {
+  byte trailer = trailerForBlock(firstBlockOfSector(sector));
+  MFRC522::MIFARE_Key key;
+
+  for (byte cmd = 0; cmd < 2; cmd++) {
+    byte authCmd = (cmd == 0) ? MFRC522::PICC_CMD_MF_AUTH_KEY_A
+                              : MFRC522::PICC_CMD_MF_AUTH_KEY_B;
+    for (uint8_t i = 0; i < KEY_DICT_COUNT; i++) {
+      if (!loadKey(String(KEY_DICT[i]), key)) continue;
+      MFRC522::StatusCode st = rfid.PCD_Authenticate(authCmd, trailer, &key, &(rfid.uid));
+      if (st == MFRC522::STATUS_OK) {
+        outKeyHex = String(KEY_DICT[i]);
+        outKeyType = (cmd == 0) ? 'A' : 'B';
+        return true;
+      }
+      // A failed auth can leave the PICC unselected; re-select before next try.
+      rfid.PCD_StopCrypto1();
+      byte atqa[2]; byte atqaSize = sizeof(atqa);
+      rfid.PICC_WakeupA(atqa, &atqaSize);
+      rfid.PICC_ReadCardSerial();
+    }
+  }
+  return false;
+}
+
+// Gen1a "magic" backdoor open via the library helper. The library implementation
+// does PICC_HaltA -> 0x40 (7 valid bits) -> 0x43 and expects an 0x0A ACK.
+static bool magicOpenGen1a() {
+  return rfid.MIFARE_OpenUidBackdoor(false);
+}
+
+// Documented fallback: send a short (7-bit) frame, e.g. the Gen1a 0x40 wakeup.
+// Kept for reference/debugging; not used in the main path because the library
+// helper above already implements the full backdoor handshake.
+static MFRC522::StatusCode sendShortFrame(byte cmd, byte validBits) {
+  byte back[4];
+  byte backLen = sizeof(back);
+  byte vb = validBits;
+  return rfid.PCD_TransceiveData(&cmd, 1, back, &backLen, &vb, 0, false);
+}
+
+// SAFE Gen2 detection: dict-auth sector 0, read block 0, write the SAME bytes
+// back, re-read and compare. Returns true only if the write succeeded AND the
+// data is unchanged (i.e. block 0 is writable on this card). Never alters data.
+static bool detectGen2Writable() {
+  String kh; char kt;
+  if (!authSectorWithDict(0, kh, kt)) return false;
+
+  byte before[18]; byte sz = sizeof(before);
+  if (rfid.MIFARE_Read(0, before, &sz) != MFRC522::STATUS_OK) {
+    rfid.PCD_StopCrypto1();
+    return false;
+  }
+  byte data16[16];
+  memcpy(data16, before, 16);
+
+  MFRC522::StatusCode w = rfid.MIFARE_Write(0, data16, 16);
+  if (w != MFRC522::STATUS_OK) {
+    rfid.PCD_StopCrypto1();
+    return false;
+  }
+  byte after[18]; byte sz2 = sizeof(after);
+  bool ok = (rfid.MIFARE_Read(0, after, &sz2) == MFRC522::STATUS_OK) &&
+            (memcmp(before, after, 16) == 0);
+  rfid.PCD_StopCrypto1();
+  return ok;
+}
+
 static void commandPing() {
   Serial.println("OK PONG");
 }
@@ -317,7 +453,24 @@ static void commandScan() {
   if (rfid.uid.sak < 0x10) Serial.print('0');
   Serial.print(rfid.uid.sak, HEX);
   Serial.print(" TYPE=");
-  Serial.println(currentTypeToken());
+  Serial.print(currentTypeToken());
+
+  // v0.3: always surface ATQA (captured in selectCard).
+  Serial.print(" ATQA=0x");
+  if (lastAtqa < 0x1000) Serial.print('0');
+  if (lastAtqa < 0x0100) Serial.print('0');
+  if (lastAtqa < 0x0010) Serial.print('0');
+  Serial.print(lastAtqa, HEX);
+
+  // v0.3: for ISO-14443-4 cards, append ATS hex when RATS succeeds.
+  if (currentCardFamily() == CardFamily::ISO4) {
+    MFRC522Extended::Ats ats;
+    if (rfid.PICC_RequestATS(&ats) == MFRC522::STATUS_OK && ats.size > 0) {
+      Serial.print(" ATS=");
+      Serial.print(bytesToHex(ats.data, ats.size, false));
+    }
+  }
+  Serial.println();
 }
 
 static void commandReadBlock(byte block, const String& keyHex) {
@@ -574,6 +727,572 @@ static void commandWritePage(byte page, const String& dataHex) {
   Serial.println(bytesToHex(data, 4, false));
 }
 
+// ============================================================================
+// v0.3 cloning primitives — commands
+// ============================================================================
+
+// Print a trailer-relative hex byte helper for 0x-prefixed two-digit output.
+static void printHex2(byte b) {
+  if (b < 0x10) Serial.print('0');
+  Serial.print(b, HEX);
+}
+
+// Full Classic read across all sectors using the key dictionary.
+static void cloneReadClassic() {
+  MFRC522::PICC_Type type = rfid.PICC_GetType(rfid.uid.sak);
+  byte sectors = sectorCount(type);
+
+  Serial.print("OK CLONE_BEGIN UID=");
+  Serial.print(currentUidHex());
+  Serial.print(" SIZE=");
+  Serial.print(rfid.uid.size);
+  Serial.print(" SAK=0x");
+  printHex2(rfid.uid.sak);
+  Serial.print(" TYPE=");
+  Serial.print(currentTypeToken());
+  Serial.print(" SECTORS=");
+  Serial.println(sectors);
+
+  byte okSectors = 0, failedSectors = 0;
+
+  for (byte s = 0; s < sectors; s++) {
+    String keyHex; char keyType;
+    bool authed = authSectorWithDict(s, keyHex, keyType);
+
+    Serial.print("SECTOR=");
+    Serial.print(s);
+    Serial.print(" KEY=");
+    if (authed) {
+      Serial.print(keyHex);
+      Serial.print(" KEYTYPE=");
+      Serial.print(keyType);
+      Serial.println(" STATUS=OK");
+    } else {
+      Serial.print("------------");
+      Serial.println(" KEYTYPE=NONE STATUS=FAILED");
+      failedSectors++;
+      continue;  // No block lines for a failed sector.
+    }
+
+    okSectors++;
+    byte first = firstBlockOfSector(s);
+    byte count = blocksInSector(s);
+    for (byte b = first; b < first + count; b++) {
+      byte buffer[18]; byte sz = sizeof(buffer);
+      MFRC522::StatusCode st = rfid.MIFARE_Read(b, buffer, &sz);
+      Serial.print("BLOCK=");
+      Serial.print(b);
+      if (st == MFRC522::STATUS_OK) {
+        Serial.print(" DATA=");
+        Serial.println(bytesToHex(buffer, 16, false));
+      } else {
+        Serial.print(" ERR=");
+        Serial.println(statusName(st));
+      }
+    }
+    rfid.PCD_StopCrypto1();
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+  Serial.print("OK CLONE_END OK_SECTORS=");
+  Serial.print(okSectors);
+  Serial.print(" FAILED_SECTORS=");
+  Serial.println(failedSectors);
+}
+
+// Full Ultralight/NTAG page dump. MIFARE_Read returns 4 pages per call; we emit
+// one line per single page. Page count is derived by reading until error, with
+// a hard cap of 231 (NTAG216 has 231 user+config pages).
+static void cloneReadUltralight() {
+  Serial.print("OK ULDUMP_BEGIN UID=");
+  Serial.print(currentUidHex());
+  Serial.print(" SIZE=");
+  Serial.print(rfid.uid.size);
+  Serial.print(" TYPE=");
+  Serial.print(currentTypeToken());
+
+  // First pass: determine page count by probing 4-page reads until failure.
+  const byte PAGE_CAP = 231;
+  byte pageCount = 0;
+  for (byte p = 0; p < PAGE_CAP; p += 4) {
+    byte buf[18]; byte sz = sizeof(buf);
+    if (rfid.MIFARE_Read(p, buf, &sz) != MFRC522::STATUS_OK) break;
+    byte got = 4;
+    if ((int)p + 4 > (int)PAGE_CAP) got = PAGE_CAP - p;
+    pageCount = p + got;
+  }
+  if (pageCount == 0) pageCount = 16;  // conservative floor if probing failed
+  Serial.print(" PAGES=");
+  Serial.println(pageCount);
+
+  byte okPages = 0, failedPages = 0;
+  for (byte p = 0; p < pageCount; p++) {
+    byte buf[18]; byte sz = sizeof(buf);
+    // Read 4 pages at p but emit only this single page's 4 bytes.
+    MFRC522::StatusCode st = rfid.MIFARE_Read(p, buf, &sz);
+    Serial.print("PAGE=");
+    Serial.print(p);
+    if (st == MFRC522::STATUS_OK) {
+      Serial.print(" DATA=");
+      Serial.println(bytesToHex(buf, 4, false));
+      okPages++;
+    } else {
+      Serial.print(" ERR=");
+      Serial.println(statusName(st));
+      failedPages++;
+    }
+  }
+  rfid.PICC_HaltA();
+  Serial.print("OK ULDUMP_END OK_PAGES=");
+  Serial.print(okPages);
+  Serial.print(" FAILED_PAGES=");
+  Serial.println(failedPages);
+}
+
+static void commandCloneRead() {
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+  CardFamily fam = currentCardFamily();
+  if (fam == CardFamily::CLASSIC) {
+    cloneReadClassic();
+  } else if (fam == CardFamily::ULTRALIGHT) {
+    cloneReadUltralight();
+  } else {
+    Serial.print("ERR CLONE_UNSUPPORTED TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+  }
+}
+
+static void commandCloneReadUl() {
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+  CardFamily fam = currentCardFamily();
+  if (fam != CardFamily::ULTRALIGHT) {
+    Serial.print("ERR CLONE_UNSUPPORTED TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+    return;
+  }
+  cloneReadUltralight();
+}
+
+// SAFE magic detection. Determines Gen1a (backdoor) / Gen2 (direct block0 write)
+// for Classic, or magic Ultralight (rewriting pages 0-2 unchanged). Never alters
+// data: Gen2 and UL detection write existing bytes back unchanged.
+static void commandMagicDetect() {
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+  CardFamily fam = currentCardFamily();
+
+  if (fam == CardFamily::CLASSIC) {
+    // Try the Gen1a backdoor first; it is non-destructive (just opens access).
+    if (magicOpenGen1a()) {
+      rfid.PICC_HaltA();
+      byte uidlen = (rfid.uid.size == 7) ? 7 : 4;
+      Serial.print("OK MAGIC TYPE=CLASSIC GEN=GEN1A UIDLEN=");
+      Serial.print(uidlen);
+      Serial.println(" METHOD=BACKDOOR");
+      return;
+    }
+    // Re-select after the backdoor probe before trying Gen2.
+    selectCard();
+    if (detectGen2Writable()) {
+      rfid.PICC_HaltA();
+      byte uidlen = (rfid.uid.size == 7) ? 7 : 4;
+      Serial.print("OK MAGIC TYPE=CLASSIC GEN=GEN2 UIDLEN=");
+      Serial.print(uidlen);
+      Serial.println(" METHOD=DIRECT");
+      return;
+    }
+    rfid.PICC_HaltA();
+    byte uidlen = (rfid.uid.size == 7) ? 7 : 4;
+    Serial.print("OK MAGIC TYPE=CLASSIC GEN=NORMAL UIDLEN=");
+    Serial.print(uidlen);
+    Serial.println(" METHOD=NONE");
+    return;
+  }
+
+  if (fam == CardFamily::ULTRALIGHT) {
+    // Magic UL test: rewrite pages 0-2 with their EXISTING bytes (unchanged).
+    bool magic = true;
+    for (byte p = 0; p <= 2 && magic; p++) {
+      byte buf[18]; byte sz = sizeof(buf);
+      if (rfid.MIFARE_Read(p, buf, &sz) != MFRC522::STATUS_OK) { magic = false; break; }
+      byte same[4]; memcpy(same, buf, 4);
+      if (rfid.MIFARE_Ultralight_Write(p, same, 4) != MFRC522::STATUS_OK) magic = false;
+    }
+    rfid.PICC_HaltA();
+    if (magic) {
+      Serial.println("OK MAGIC TYPE=ULTRALIGHT GEN=MAGIC METHOD=DIRECT");
+    } else {
+      Serial.println("OK MAGIC TYPE=ULTRALIGHT GEN=NORMAL METHOD=NONE");
+    }
+    return;
+  }
+
+  Serial.print("ERR MAGIC_UNSUPPORTED TYPE=");
+  Serial.println(currentTypeToken());
+  rfid.PICC_HaltA();
+}
+
+static void commandCloneUid(const String& block0Hex, const String& method) {
+  byte block0[16];
+  if (!hexToBytes(block0Hex, block0, 16)) {
+    Serial.println("ERR BAD_DATA expected 32 hex chars");
+    return;
+  }
+  // BCC check for 4-byte UID: byte[4] must equal uid0^uid1^uid2^uid3.
+  byte expectedBcc = bccClassic(block0);
+  if (block0[4] != expectedBcc) {
+    Serial.print("ERR CLONE_UID_BAD_BCC EXPECTED=0x");
+    printHex2(expectedBcc);
+    Serial.print(" GOT=0x");
+    printHex2(block0[4]);
+    Serial.println();
+    return;
+  }
+
+  String m = method;
+  m.toUpperCase();
+
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+  if (currentCardFamily() != CardFamily::CLASSIC) {
+    Serial.print("ERR CLONE_UNSUPPORTED TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+    return;
+  }
+
+  // AUTO: pick a method via the same logic as MAGIC_DETECT.
+  if (m == "AUTO") {
+    if (magicOpenGen1a()) {
+      m = "GEN1A";
+      // backdoor is already open; fall through to GEN1A path which re-opens.
+      rfid.PICC_HaltA();
+      selectCard();
+    } else {
+      selectCard();
+      m = detectGen2Writable() ? "GEN2" : "NORMAL";
+      selectCard();
+    }
+  }
+
+  if (m == "NORMAL") {
+    Serial.println("ERR CLONE_UID_NORMAL_CARD");
+    rfid.PICC_HaltA();
+    return;
+  }
+
+  if (m == "GEN1A") {
+    // Gen1a magic supports 4-byte UID block0 only.
+    if (rfid.uid.size == 7) {
+      Serial.println("ERR CLONE_UID_GEN1A_4BYTE_ONLY");
+      rfid.PICC_HaltA();
+      return;
+    }
+    if (!magicOpenGen1a()) {
+      Serial.println("ERR CLONE_UID_NORMAL_CARD");
+      rfid.PICC_HaltA();
+      return;
+    }
+    MFRC522::StatusCode st = rfid.MIFARE_Write(0, block0, 16);
+    rfid.PICC_HaltA();
+    if (st != MFRC522::STATUS_OK) {
+      Serial.print("ERR CLONE_UID ");
+      Serial.println(statusName(st));
+      return;
+    }
+    Serial.print("OK CLONE_UID METHOD=GEN1A UID=");
+    Serial.println(bytesToHex(block0, 4, false));
+    return;
+  }
+
+  if (m == "GEN2" || m == "DIRECT") {
+    String kh; char kt;
+    if (!authSectorWithDict(0, kh, kt)) {
+      Serial.println("ERR CLONE_UID_NORMAL_CARD");
+      rfid.PCD_StopCrypto1();
+      rfid.PICC_HaltA();
+      return;
+    }
+    MFRC522::StatusCode st = rfid.MIFARE_Write(0, block0, 16);
+    rfid.PCD_StopCrypto1();
+    rfid.PICC_HaltA();
+    if (st != MFRC522::STATUS_OK) {
+      Serial.print("ERR CLONE_UID ");
+      Serial.println(statusName(st));
+      return;
+    }
+    Serial.print("OK CLONE_UID METHOD=GEN2 UID=");
+    Serial.println(bytesToHex(block0, 4, false));
+    return;
+  }
+
+  Serial.println("ERR USAGE CLONE_UID <block0hex32> METHOD=<GEN1A|GEN2|AUTO>");
+  rfid.PICC_HaltA();
+}
+
+// WRITE_BLOCK_RAW: dictionary/provided-key auth then write a data block.
+// Refuses block 0 and sector trailers (same safety as WRITE_BLOCK).
+static void commandWriteBlockRaw(byte block, const String& dataHex, const String& keyHex) {
+  if (block == 0) {
+    Serial.println("ERR REFUSE_BLOCK_ZERO");
+    return;
+  }
+  if (isSectorTrailer(block)) {
+    Serial.println("ERR REFUSE_SECTOR_TRAILER");
+    return;
+  }
+  byte data[16];
+  if (!hexToBytes(dataHex, data, 16)) {
+    Serial.println("ERR BAD_DATA expected 32 hex chars");
+    return;
+  }
+
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+  if (currentCardFamily() != CardFamily::CLASSIC) {
+    Serial.print("ERR UNSUPPORTED_CARD TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+    return;
+  }
+
+  if (!authenticateBlock(block, keyHex)) {
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    return;
+  }
+  MFRC522::StatusCode st = rfid.MIFARE_Write(block, data, 16);
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+  if (st != MFRC522::STATUS_OK) {
+    Serial.print("ERR WRITE ");
+    Serial.println(statusName(st));
+    return;
+  }
+  // Reuse the WRITE_BLOCK success framing for web-parser reuse.
+  Serial.print("OK WROTE BLOCK=");
+  Serial.print(block);
+  Serial.print(" DATA=");
+  Serial.println(bytesToHex(data, 16, false));
+}
+
+// Validate the 3-byte access-bits field (trailer bytes 6,7,8) for internal
+// self-consistency: byte7 high nibble must be the inverse of byte6 low nibble,
+// and the standard inversion relationships must hold. Returns true if valid.
+static bool accessBitsSelfConsistent(const byte* t) {
+  byte b6 = t[6], b7 = t[7], b8 = t[8];
+  // Extract the inverted (c?_) and true (c?) nibbles per MIFARE trailer layout.
+  byte c1_  = (b7 >> 4) & 0x0F;
+  byte c1   = (b8 >> 4) & 0x0F;
+  byte c2_  = (b6) & 0x0F;
+  byte c2   = (b8) & 0x0F;
+  byte c3_  = (b6 >> 4) & 0x0F;
+  byte c3   = (b7) & 0x0F;
+  // The inverted nibbles must be the bitwise complement (low 4 bits) of the true.
+  if (((c1 ^ c1_) & 0x0F) != 0x0F) return false;
+  if (((c2 ^ c2_) & 0x0F) != 0x0F) return false;
+  if (((c3 ^ c3_) & 0x0F) != 0x0F) return false;
+  return true;
+}
+
+// WRITE_TRAILER: write a 16-byte sector trailer. Validates trailer position and
+// access-bit self-consistency. Warns if the incoming Key A region is all zero.
+static void commandWriteTrailer(byte block, const String& dataHex, const String& keyHex) {
+  if (!isSectorTrailer(block)) {
+    Serial.println("ERR NOT_A_TRAILER");
+    return;
+  }
+  byte data[16];
+  if (!hexToBytes(dataHex, data, 16)) {
+    Serial.println("ERR BAD_DATA expected 32 hex chars");
+    return;
+  }
+  if (!accessBitsSelfConsistent(data)) {
+    Serial.println("ERR TRAILER_BAD_ACCESS_BITS");
+    return;
+  }
+  bool zeroKeyA = (data[0] | data[1] | data[2] | data[3] | data[4] | data[5]) == 0;
+
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+  if (currentCardFamily() != CardFamily::CLASSIC) {
+    Serial.print("ERR UNSUPPORTED_CARD TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+    return;
+  }
+  if (!authenticateBlock(block, keyHex)) {
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+    return;
+  }
+  MFRC522::StatusCode st = rfid.MIFARE_Write(block, data, 16);
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+  if (st != MFRC522::STATUS_OK) {
+    Serial.print("ERR WRITE ");
+    Serial.println(statusName(st));
+    return;
+  }
+  Serial.print("OK WROTE_TRAILER BLOCK=");
+  Serial.print(block);
+  if (zeroKeyA) Serial.print(" WARN=ZERO_KEYA");
+  Serial.println();
+}
+
+// WRITE_PAGE_RAW: magic-NTAG raw page write. Allows pages 0-2 (for magic UID
+// rewrite), refuses page 3 (OTP) and a cascade-tag byte at page1[0]==0x88.
+static void commandWritePageRaw(byte page, const String& dataHex) {
+  byte data[4];
+  if (!hexToBytes(dataHex, data, 4)) {
+    Serial.println("ERR BAD_DATA expected 8 hex chars");
+    return;
+  }
+  if (page == 3) {
+    Serial.println("ERR REFUSE_PAGE_OTP");
+    return;
+  }
+  if (page == 1 && data[0] == 0x88) {
+    Serial.println("ERR REFUSE_UL_CASCADE_BYTE");
+    return;
+  }
+
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+  if (currentCardFamily() != CardFamily::ULTRALIGHT) {
+    Serial.print("ERR UNSUPPORTED_CARD TYPE=");
+    Serial.println(currentTypeToken());
+    rfid.PICC_HaltA();
+    return;
+  }
+  MFRC522::StatusCode st = rfid.MIFARE_Ultralight_Write(page, data, 4);
+  rfid.PICC_HaltA();
+  if (st != MFRC522::STATUS_OK) {
+    Serial.print("ERR WRITE ");
+    Serial.println(statusName(st));
+    return;
+  }
+  Serial.print("OK WROTE_PAGE PAGE=");
+  Serial.print(page);
+  Serial.print(" DATA=");
+  Serial.println(bytesToHex(data, 4, false));
+}
+
+// ATS: request Answer To Select for ISO-14443-4 cards.
+static void commandAts() {
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+  if (currentCardFamily() != CardFamily::ISO4) {
+    Serial.println("ERR WRONG_CARD_TYPE");
+    rfid.PICC_HaltA();
+    return;
+  }
+  MFRC522Extended::Ats ats;
+  if (rfid.PICC_RequestATS(&ats) != MFRC522::STATUS_OK || ats.size == 0) {
+    Serial.println("ERR NO_ATS");
+    rfid.PICC_HaltA();
+    return;
+  }
+  Serial.print("OK ATS=");
+  Serial.print(bytesToHex(ats.data, ats.size, false));
+  // Historical bytes follow the format byte (T0) and any TA/TB/TC interface
+  // bytes. Compute their offset from the interface-byte presence flags.
+  byte off = 2;  // skip TL (data[0]) and T0 (data[1])
+  if (ats.ta1.transmitted) off++;
+  if (ats.tb1.transmitted) off++;
+  if (ats.tc1.transmitted) off++;
+  Serial.print(" HISTBYTES=");
+  if (ats.size > off) {
+    Serial.println(bytesToHex(ats.data + off, ats.size - off, false));
+  } else {
+    Serial.println("-");
+  }
+}
+
+// APDU: single ISO-14443-4 T=CL exchange.
+static void commandApdu(const String& capduHex) {
+  String hx = capduHex;
+  hx.trim();
+  hx.replace(" ", "");
+  if ((hx.length() % 2) != 0 || hx.length() == 0) {
+    Serial.println("ERR BAD_DATA expected even-length hex");
+    return;
+  }
+  byte reqLen = hx.length() / 2;
+  if (reqLen > 60) {
+    Serial.println("ERR APDU_TOO_LONG");
+    return;
+  }
+  byte req[60];
+  if (!hexToBytes(hx, req, reqLen)) {
+    Serial.println("ERR BAD_DATA expected even-length hex");
+    return;
+  }
+
+  if (!selectCard()) {
+    Serial.println("ERR NO_CARD");
+    return;
+  }
+  if (currentCardFamily() != CardFamily::ISO4) {
+    Serial.println("ERR WRONG_CARD_TYPE");
+    rfid.PICC_HaltA();
+    return;
+  }
+  // Activate T=CL: request ATS into the member tag struct used by TCL_Transceive.
+  if (rfid.PICC_RequestATS(&rfid.tag.ats) != MFRC522::STATUS_OK) {
+    Serial.println("ERR NO_ATS");
+    rfid.PICC_HaltA();
+    return;
+  }
+
+  byte resp[64];
+  byte respLen = sizeof(resp);
+  MFRC522::StatusCode st = rfid.TCL_Transceive(&rfid.tag, req, reqLen, resp, &respLen);
+  if (st != MFRC522::STATUS_OK) {
+    Serial.print("ERR APDU ");
+    Serial.println(statusName(st));
+    rfid.PICC_HaltA();
+    return;
+  }
+  if (respLen > 60) {
+    Serial.println("ERR APDU_TOO_LONG");
+    rfid.PICC_HaltA();
+    return;
+  }
+
+  Serial.print("OK APDU RESP=");
+  if (respLen > 0) Serial.print(bytesToHex(resp, respLen, false));
+  // The trailing two bytes (if present) are the ISO-7816 status word SW1 SW2.
+  Serial.print(" SW=");
+  if (respLen >= 2) {
+    Serial.println(bytesToHex(resp + (respLen - 2), 2, false));
+  } else {
+    Serial.println("-");
+  }
+  rfid.PICC_HaltA();
+}
+
 static String nextToken(String& rest) {
   rest.trim();
   if (rest.length() == 0) return "";
@@ -588,6 +1307,19 @@ static String nextToken(String& rest) {
   rest = rest.substring(idx + 1);
   token.trim();
   return token;
+}
+
+// Returns the value of a "PREFIX=value" token. Prefix match is case-insensitive
+// on the key; if the token does not start with the prefix, returns "".
+static String stripPrefix(const String& token, const char* prefix) {
+  String up = token;
+  up.toUpperCase();
+  String p = String(prefix);
+  p.toUpperCase();
+  if (up.startsWith(p)) {
+    return token.substring(strlen(prefix));
+  }
+  return "";
 }
 
 static void handleCommand(String line) {
@@ -689,6 +1421,73 @@ static void handleCommand(String line) {
       return;
     }
     commandDump((byte)startBlock, (byte)endBlock, keyHex);
+  } else if (cmd == "CLONE_READ") {
+    commandCloneRead();
+  } else if (cmd == "CLONE_READ_UL") {
+    commandCloneReadUl();
+  } else if (cmd == "MAGIC_DETECT") {
+    commandMagicDetect();
+  } else if (cmd == "CLONE_UID") {
+    String block0Hex = nextToken(rest);
+    String methodTok = nextToken(rest);   // expected "METHOD=<...>"
+    String method = stripPrefix(methodTok, "METHOD=");
+    if (block0Hex.length() == 0 || method.length() == 0) {
+      Serial.println("ERR USAGE CLONE_UID <block0hex32> METHOD=<GEN1A|GEN2|AUTO>");
+      return;
+    }
+    commandCloneUid(block0Hex, method);
+  } else if (cmd == "WRITE_BLOCK_RAW") {
+    String blockStr = nextToken(rest);
+    String dataHex = nextToken(rest);
+    String keyTok = nextToken(rest);       // expected "KEY=<hex12>"
+    String keyHex = stripPrefix(keyTok, "KEY=");
+    if (blockStr.length() == 0 || dataHex.length() == 0 || keyHex.length() == 0) {
+      Serial.println("ERR USAGE WRITE_BLOCK_RAW <block> <hex32> KEY=<hex12>");
+      return;
+    }
+    int block = blockStr.toInt();
+    if (block < 0 || block > 255) {
+      Serial.println("ERR BAD_BLOCK");
+      return;
+    }
+    commandWriteBlockRaw((byte)block, dataHex, keyHex);
+  } else if (cmd == "WRITE_TRAILER") {
+    String blockStr = nextToken(rest);
+    String dataHex = nextToken(rest);
+    String keyTok = nextToken(rest);
+    String keyHex = stripPrefix(keyTok, "KEY=");
+    if (blockStr.length() == 0 || dataHex.length() == 0 || keyHex.length() == 0) {
+      Serial.println("ERR USAGE WRITE_TRAILER <trailerBlock> <hex32> KEY=<hex12>");
+      return;
+    }
+    int block = blockStr.toInt();
+    if (block < 0 || block > 255) {
+      Serial.println("ERR BAD_BLOCK");
+      return;
+    }
+    commandWriteTrailer((byte)block, dataHex, keyHex);
+  } else if (cmd == "WRITE_PAGE_RAW") {
+    String pageStr = nextToken(rest);
+    String dataHex = nextToken(rest);
+    if (pageStr.length() == 0 || dataHex.length() == 0) {
+      Serial.println("ERR USAGE WRITE_PAGE_RAW <page> <hex8>");
+      return;
+    }
+    int page = pageStr.toInt();
+    if (page < 0 || page > 255) {
+      Serial.println("ERR BAD_PAGE");
+      return;
+    }
+    commandWritePageRaw((byte)page, dataHex);
+  } else if (cmd == "ATS") {
+    commandAts();
+  } else if (cmd == "APDU") {
+    String capdu = nextToken(rest);
+    if (capdu.length() == 0) {
+      Serial.println("ERR USAGE APDU <hexCAPDU>");
+      return;
+    }
+    commandApdu(capdu);
   } else {
     Serial.print("ERR UNKNOWN_COMMAND ");
     Serial.println(cmd);

@@ -1,4 +1,7 @@
-import type { OpResult, CardInfo, BlockResult, PageResult, CardFamily } from './types.js';
+import type {
+  OpResult, CardInfo, BlockResult, PageResult, CardFamily,
+  CardImage, MagicInfo, AtsInfo, ApduResult, CloneSummary,
+} from './types.js';
 
 // ── DOM builder helpers ───────────────────────────────────────────────────────
 
@@ -163,6 +166,97 @@ export function buildDOM(): void {
   unsupportedGroup.style.cssText = 'display: none; margin-top: 22px; padding: 12px; border: 1px solid var(--border); border-radius: 10px; color: var(--muted);';
   unsupportedGroup.textContent = 'UID only — block/page operations not supported for this card type.';
 
+  // ── CLONE panel (CLASSIC / ULTRALIGHT) ───────────────────────────────────
+  const cloneHeading = make('h2', { style: 'margin-top: 22px;' });
+  cloneHeading.textContent = 'Clone workflow';
+
+  const cloneReadBtn = btn('cloneRead', 'btn-clone-read', 'Read Source');
+  const cloneDetectBtn = btn('cloneDetect', 'btn-clone-detect', 'Detect Target');
+  const cloneWriteBtn = btn('cloneWrite', 'btn-clone-write', 'Write Clone', 'danger');
+  const cloneExportBtn = btn('cloneExport', 'btn-clone-export', 'Export JSON');
+  const cloneImportBtn = btn('cloneImport', 'btn-clone-import', 'Import JSON');
+  const cloneBtns = div({ class: 'buttons' }, cloneReadBtn, cloneDetectBtn, cloneWriteBtn, cloneExportBtn, cloneImportBtn);
+
+  const cloneImportInput = make('textarea', { id: 'cloneImportInput', 'data-testid': 'input-clone-import' });
+  cloneImportInput.spellcheck = false;
+  cloneImportInput.style.cssText = 'min-height: 44px; font-family: ui-monospace, monospace; font-size: 12px;';
+  cloneImportInput.placeholder = 'Paste exported image JSON, then click Import JSON';
+
+  // key dictionary toggle
+  const keyDictCheckbox = make('input', { id: 'keyDict', 'data-testid': 'toggle-keydict', type: 'checkbox' });
+  keyDictCheckbox.style.cssText = 'width: auto; flex: 0 0 auto; margin: 0;';
+  keyDictCheckbox.checked = true;
+  const keyDictText = make('span', {});
+  keyDictText.textContent = 'Use key dictionary';
+  const keyDictLabel = make('label', { for: 'keyDict' });
+  keyDictLabel.style.cssText = 'display: flex; align-items: center; gap: 8px; margin: 10px 0 0; cursor: pointer;';
+  keyDictLabel.append(keyDictCheckbox, keyDictText);
+  const keyDictStatus = make('div', { id: 'keydictStatus', 'data-testid': 'keydict-status' });
+  keyDictStatus.style.cssText = 'font-size: 12px; color: var(--muted); margin-top: 4px;';
+  keyDictStatus.textContent = 'Dictionary: ON';
+
+  const cloneImagePanel = make('div', { id: 'cloneImagePanel', 'data-testid': 'clone-image-panel', class: 'card-panel empty' });
+  cloneImagePanel.style.cssText = 'margin-top: 12px; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; max-height: 240px; overflow: auto;';
+  cloneImagePanel.textContent = 'No source image captured.';
+
+  const cloneTargetPanel = make('div', { id: 'cloneTargetPanel', 'data-testid': 'clone-target-panel', class: 'card-panel empty' });
+  cloneTargetPanel.style.cssText = 'margin-top: 12px; font-size: 13px;';
+  cloneTargetPanel.textContent = 'No target detected.';
+
+  const cloneProgress = make('div', { id: 'cloneProgress', 'data-testid': 'clone-progress', 'data-clone-progress': '0/0' });
+  cloneProgress.style.cssText = 'margin-top: 10px; font-size: 13px; color: var(--muted);';
+  cloneProgress.textContent = 'Progress: 0/0';
+
+  const cloneSummary = make('div', { id: 'cloneSummary', 'data-testid': 'clone-summary' });
+  cloneSummary.style.cssText = 'margin-top: 10px; font-size: 13px;';
+
+  const cloneGroup = make('div', { id: 'cloneGroup', 'data-testid': 'clone-panel' },
+    cloneHeading,
+    cloneBtns,
+    keyDictLabel,
+    keyDictStatus,
+    cloneImagePanel,
+    cloneTargetPanel,
+    cloneProgress,
+    cloneSummary,
+    cloneImportInput,
+  );
+
+  // ── ISO4 identify panel ───────────────────────────────────────────────────
+  const iso4Heading = make('h2', { style: 'margin-top: 22px;' });
+  iso4Heading.textContent = 'ISO 14443-4 identify';
+
+  const cloneImpossible = make('div', { id: 'cloneImpossible', 'data-testid': 'clone-impossible-notice' });
+  cloneImpossible.style.cssText = 'margin: 8px 0; padding: 10px; border: 1px solid var(--danger); border-radius: 10px; color: var(--danger); font-weight: 700;';
+  cloneImpossible.textContent = 'Clone not possible: DESFire / EMV / phone-emulated cards cannot be cloned.';
+
+  const atsDisplay = make('div', { id: 'atsDisplay', 'data-testid': 'ats-display' });
+  atsDisplay.style.cssText = 'margin: 8px 0; font-family: ui-monospace, monospace; font-size: 13px;';
+  atsDisplay.textContent = 'ATS: (not read)';
+
+  const atsBtn = btn('atsRead', 'btn-ats-read', 'Read ATS');
+
+  const apduInput = inputEl('apdu', 'input-apdu');
+  (apduInput as HTMLInputElement).placeholder = '60';
+  (apduInput as HTMLInputElement).value = '60';
+  const apduSendBtn = btn('apduSend', 'btn-apdu-send', 'Send APDU');
+  const apduRow = div({ class: 'row' }, apduInput, apduSendBtn);
+
+  const apduResponse = make('div', { id: 'apduResponse', 'data-testid': 'apdu-response' });
+  apduResponse.style.cssText = 'margin-top: 8px; font-family: ui-monospace, monospace; font-size: 13px;';
+  apduResponse.textContent = 'APDU response: (none)';
+
+  const iso4Group = make('div', { id: 'iso4Group', 'data-testid': 'iso4-panel' },
+    iso4Heading,
+    cloneImpossible,
+    div({ class: 'buttons' }, atsBtn),
+    atsDisplay,
+    lbl('apdu', 'APDU (hex)'),
+    apduRow,
+    apduResponse,
+  );
+  iso4Group.style.display = 'none';
+
   // Auto-read toggle (near the action buttons)
   const autoReadCheckbox = make('input', { id: 'autoRead', 'data-testid': 'toggle-autoread', type: 'checkbox' });
   autoReadCheckbox.style.cssText = 'width: auto; flex: 0 0 auto; margin: 0;';
@@ -197,6 +291,8 @@ export function buildDOM(): void {
     classicGroup,
     ulGroup,
     unsupportedGroup,
+    cloneGroup,
+    iso4Group,
     rawHeading,
     lbl('raw', 'Command'),
     rawInput,
@@ -236,6 +332,9 @@ export function getRescanInput(): HTMLInputElement { return elById('rescan'); }
 export function getRawInput(): HTMLInputElement { return elById('raw'); }
 export function getAutoReadToggle(): HTMLInputElement { return elById('autoRead'); }
 export function getLogEl(): HTMLElement { return elById('log'); }
+export function getCloneImportInput(): HTMLTextAreaElement { return elById('cloneImportInput'); }
+export function getKeyDictToggle(): HTMLInputElement { return elById('keyDict'); }
+export function getApduInput(): HTMLInputElement { return elById('apdu'); }
 
 // Reflect the auto-read toggle state visually (highlight the label when ON).
 export function renderAutoReadState(on: boolean): void {
@@ -271,10 +370,15 @@ export function renderCardType(card: CardInfo): void {
 
 /** Show only the controls relevant to the detected card family. */
 export function renderCardFamily(family: CardFamily): void {
-  elById('classicGroup').style.display = family === 'CLASSIC' ? '' : 'none';
-  elById('ultralightGroup').style.display = family === 'ULTRALIGHT' ? '' : 'none';
-  elById('unsupportedGroup').style.display =
-    family === 'ISO4' || family === 'UNKNOWN' ? '' : 'none';
+  const isClassic = family === 'CLASSIC';
+  const isUl = family === 'ULTRALIGHT';
+  const isIso = family === 'ISO4' || family === 'UNKNOWN';
+  elById('classicGroup').style.display = isClassic ? '' : 'none';
+  elById('ultralightGroup').style.display = isUl ? '' : 'none';
+  elById('unsupportedGroup').style.display = isIso ? '' : 'none';
+  // Clone panel only for cloneable families; ISO4 identify panel for ISO4/UNKNOWN.
+  elById('cloneGroup').style.display = (isClassic || isUl) ? '' : 'none';
+  elById('iso4Group').style.display = isIso ? '' : 'none';
 }
 
 export function renderBlockData(blockResult: BlockResult): void {
@@ -331,6 +435,133 @@ export function renderPageWriteError(msg: string): void {
 
 export function clearPageWriteError(): void {
   elById('pageWriteError').textContent = '';
+}
+
+// ── v0.3: clone workflow render helpers ────────────────────────────────────────
+
+/** Render a captured CardImage into the clone-image panel (sectors/keys/blocks
+ *  or pages). FAILED sectors are flagged in red. */
+export function renderCloneImage(image: CardImage): void {
+  const panel = elById('cloneImagePanel');
+  panel.classList.remove('empty');
+  panel.replaceChildren();
+
+  const head = document.createElement('div');
+  head.style.cssText = 'margin-bottom: 6px;';
+  head.textContent = `Image: UID=${image.uid} SIZE=${image.size} TYPE=${image.type}`;
+  panel.appendChild(head);
+
+  if (image.family === 'ULTRALIGHT' && image.pages) {
+    for (const p of image.pages) {
+      const line = document.createElement('div');
+      if (p.err) {
+        line.style.color = 'var(--danger)';
+        line.textContent = `PAGE ${p.page}: ERR ${p.err}`;
+      } else {
+        line.textContent = `PAGE ${p.page}: ${p.data}`;
+      }
+      panel.appendChild(line);
+    }
+    return;
+  }
+
+  for (const sec of image.sectors ?? []) {
+    const secLine = document.createElement('div');
+    secLine.style.cssText = sec.status === 'FAILED'
+      ? 'color: var(--danger); font-weight: 700; margin-top: 4px;'
+      : 'margin-top: 4px;';
+    secLine.textContent = `SECTOR ${sec.sector} KEY=${sec.key} KEYTYPE=${sec.keyType} STATUS=${sec.status}`;
+    panel.appendChild(secLine);
+    for (const blk of sec.blocks) {
+      const line = document.createElement('div');
+      if (blk.err) {
+        line.style.color = 'var(--danger)';
+        line.textContent = `  BLOCK ${blk.block}: ERR ${blk.err}`;
+      } else {
+        line.textContent = `  BLOCK ${blk.block}: ${blk.data}`;
+      }
+      panel.appendChild(line);
+    }
+  }
+}
+
+/** Render target UID + magic gen/method + whether family matches the source. */
+export function renderCloneTarget(target: CardInfo, magic: MagicInfo | null, familyMatch: boolean): void {
+  const panel = elById('cloneTargetPanel');
+  panel.classList.remove('empty');
+  panel.replaceChildren();
+
+  const uidLine = document.createElement('div');
+  uidLine.textContent = `Target UID: ${target.uid} (${target.family})`;
+  panel.appendChild(uidLine);
+
+  if (magic) {
+    const magicLine = document.createElement('div');
+    magicLine.textContent = `Magic: GEN=${magic.gen} METHOD=${magic.method}${magic.uidLen ? ` UIDLEN=${magic.uidLen}` : ''}`;
+    panel.appendChild(magicLine);
+  }
+
+  const matchLine = document.createElement('div');
+  matchLine.style.cssText = familyMatch ? 'color: var(--ok);' : 'color: var(--danger); font-weight: 700;';
+  matchLine.textContent = familyMatch ? 'Family match: OK' : 'Family MISMATCH — clone blocked';
+  panel.appendChild(matchLine);
+}
+
+export function renderCloneProgress(done: number, total: number): void {
+  const el = elById('cloneProgress');
+  el.setAttribute('data-clone-progress', `${done}/${total}`);
+  el.textContent = `Progress: ${done}/${total}`;
+}
+
+export function renderCloneSummary(summary: CloneSummary): void {
+  const panel = elById('cloneSummary');
+  panel.replaceChildren();
+
+  const written = document.createElement('div');
+  written.textContent = `Written: ${summary.written}  Failed: ${summary.failed.length}`;
+  panel.appendChild(written);
+
+  const uid = document.createElement('div');
+  uid.textContent = summary.uidCloned
+    ? `UID cloned: YES (${summary.uidMethod})`
+    : `UID cloned: NO (${summary.uidMethod})`;
+  panel.appendChild(uid);
+
+  for (const f of summary.failed) {
+    const line = document.createElement('div');
+    line.style.color = 'var(--danger)';
+    line.textContent = `FAILED addr ${f.addr}: ${f.err}`;
+    panel.appendChild(line);
+  }
+  for (const w of summary.warnings) {
+    const line = document.createElement('div');
+    line.style.color = 'var(--muted)';
+    line.textContent = `WARN: ${w}`;
+    panel.appendChild(line);
+  }
+}
+
+export function renderKeyDictStatus(on: boolean): void {
+  elById('keydictStatus').textContent = `Dictionary: ${on ? 'ON' : 'OFF'}`;
+}
+
+export function renderAts(ats: AtsInfo): void {
+  const el = elById('atsDisplay');
+  el.textContent = `ATS: ${ats.ats}${ats.histBytes ? ` HIST=${ats.histBytes}` : ''}`;
+}
+
+export function renderApduResponse(apdu: ApduResult): void {
+  const el = elById('apduResponse');
+  el.textContent = `APDU response: RESP=${apdu.resp || '(empty)'}${apdu.sw ? ` SW=${apdu.sw}` : ''}`;
+}
+
+export function renderCloneError(msg: string): void {
+  const panel = elById('cloneSummary');
+  panel.replaceChildren();
+  const line = document.createElement('div');
+  line.style.color = 'var(--danger)';
+  line.textContent = msg;
+  panel.appendChild(line);
 }
 
 export function appendLog(line: string, kind: 'tx' | 'rx' | 'info' = 'info'): void {

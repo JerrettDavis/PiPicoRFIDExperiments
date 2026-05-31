@@ -94,6 +94,15 @@ WRITE_BLOCK <block> <hex32> [keyAhex12]
 DUMP <startBlock> <endBlock> [keyAhex12]
 READ_PAGE <page>
 WRITE_PAGE <page> <hex8>
+CLONE_READ
+CLONE_READ_UL
+MAGIC_DETECT
+CLONE_UID <block0hex32> METHOD=<GEN1A|GEN2|AUTO>
+WRITE_BLOCK_RAW <block> <hex32> KEY=<hex12>
+WRITE_TRAILER <trailerBlock> <hex32> KEY=<hex12>
+WRITE_PAGE_RAW <page> <hex8>
+ATS
+APDU <hexCAPDU>
 ```
 
 ### RESCAN — periodic re-emission
@@ -107,10 +116,10 @@ When `ms > 0`, the firmware re-emits `EVENT CARD_PRESENT UID=<uid>` every `<ms>`
 `SCAN` (aliases `UID`, `READ_UID`) reports a normalized, machine-parseable line:
 
 ```text
-OK UID=<hex> SIZE=<4|7|10> SAK=0x<NN> TYPE=<TOKEN>
+OK UID=<hex> SIZE=<4|7|10> SAK=0x<NN> TYPE=<TOKEN> ATQA=0x<NNNN> [ATS=<hex>]
 ```
 
-`TYPE` is one of: `MIFARE_MINI`, `MIFARE_1K`, `MIFARE_4K`, `MIFARE_UL`, `MIFARE_PLUS`, `ISO_14443_4`, `ISO_18092`, `UNKNOWN`. (`EVENT CARD_PRESENT UID=<hex>` is unchanged.)
+`TYPE` is one of: `MIFARE_MINI`, `MIFARE_1K`, `MIFARE_4K`, `MIFARE_UL`, `MIFARE_PLUS`, `ISO_14443_4`, `ISO_18092`, `UNKNOWN`. `ATQA` is always present (the 2-byte answer-to-request, little-endian as captured). `ATS=<hex>` is appended only for ISO-14443-4 cards when a RATS request succeeds. (`EVENT CARD_PRESENT UID=<hex>` is unchanged.)
 
 Block/page commands dispatch on the detected card family **before** any authentication:
 
@@ -139,6 +148,78 @@ These target MIFARE Ultralight and NTAG21x tags and use **no authentication**.
 
 - `READ_PAGE <page>` → `OK PAGE=<n> DATA=<32hex>` (a single read returns 16 bytes = 4 pages, starting at `<page>`). On failure: `ERR READ <status>`.
 - `WRITE_PAGE <page> <hex8>` writes exactly 4 bytes (8 hex chars) → `OK WROTE_PAGE PAGE=<n> DATA=<8hex>`. Pages `0`–`3` (UID / lock bytes / OTP) are refused with `ERR REFUSE_PAGE`. Bad hex length replies `ERR BAD_DATA`.
+
+## Cloning primitives (v0.3)
+
+These commands support inspecting and (for *magic* cards) duplicating tags. They use the `MFRC522Extended` driver, a built-in MIFARE Classic key dictionary, and the inherited magic-UID helpers.
+
+### CLONE_READ — full read of the present card
+
+Auto-dispatches by card family.
+
+**MIFARE Classic** streams a framed dump that tries the key dictionary (Key A then Key B) per sector:
+
+```text
+OK CLONE_BEGIN UID=<hex> SIZE=<n> SAK=0x<NN> TYPE=<TOKEN> SECTORS=<n>
+SECTOR=<s> KEY=<hex12|------------> KEYTYPE=<A|B|NONE> STATUS=<OK|FAILED>
+BLOCK=<b> DATA=<hex32>        # one line per readable block (or BLOCK=<b> ERR=<reason>)
+...
+OK CLONE_END OK_SECTORS=<n> FAILED_SECTORS=<n>
+```
+
+A sector whose key is not in the dictionary emits its `SECTOR=` line with `KEY=------------ KEYTYPE=NONE STATUS=FAILED` and **no** block lines. Trailer blocks are included (the Key A region reads back as zeros — expected). **Ultralight/NTAG** cards are dispatched to the `CLONE_READ_UL` framing below. **ISO-14443-4 / unknown** → `ERR CLONE_UNSUPPORTED TYPE=<TOKEN>`.
+
+### CLONE_READ_UL — full Ultralight/NTAG page dump
+
+```text
+OK ULDUMP_BEGIN UID=<hex> SIZE=<n> TYPE=<TOKEN> PAGES=<n>
+PAGE=<p> DATA=<hex8>          # one line per single page (or PAGE=<p> ERR=<reason>)
+...
+OK ULDUMP_END OK_PAGES=<n> FAILED_PAGES=<n>
+```
+
+Page count is discovered by reading until error (hard cap 231 for NTAG216).
+
+### MAGIC_DETECT — safe magic-card probe
+
+Never alters data (Gen2 / Ultralight tests write existing bytes back unchanged).
+
+- Classic → `OK MAGIC TYPE=CLASSIC GEN=<GEN1A|GEN2|NORMAL> UIDLEN=<4|7> METHOD=<BACKDOOR|DIRECT|NONE>`
+- Ultralight → `OK MAGIC TYPE=ULTRALIGHT GEN=<MAGIC|NORMAL> METHOD=<DIRECT|NONE>`
+- ISO-14443-4 → `ERR MAGIC_UNSUPPORTED TYPE=<TOKEN>`
+
+### CLONE_UID — write a new UID block (magic cards only)
+
+`CLONE_UID <block0hex32> METHOD=<GEN1A|GEN2|AUTO>`. The 32 hex chars are the full 16-byte block 0; the firmware validates the 4-byte BCC (`block0[4] == uid0^uid1^uid2^uid3`):
+
+- BCC mismatch → `ERR CLONE_UID_BAD_BCC EXPECTED=0x<NN> GOT=0x<NN>`
+- `GEN1A`: opens the Gen1a backdoor and writes block 0 (4-byte UID only; a 7-byte UID → `ERR CLONE_UID_GEN1A_4BYTE_ONLY`)
+- `GEN2`/`DIRECT`: dictionary-auths sector 0 and writes block 0 directly
+- `AUTO`: runs the `MAGIC_DETECT` logic and picks the method
+- Success → `OK CLONE_UID METHOD=<GEN1A|GEN2> UID=<newUidHex>`
+- A normal (non-magic) card → `ERR CLONE_UID_NORMAL_CARD`; other failures → `ERR CLONE_UID <statusName>`
+
+### WRITE_BLOCK_RAW / WRITE_TRAILER (Classic, explicit key)
+
+- `WRITE_BLOCK_RAW <block> <hex32> KEY=<hex12>` authenticates with the provided key and writes a data block. Block `0` → `ERR REFUSE_BLOCK_ZERO`; trailers → `ERR REFUSE_SECTOR_TRAILER`. Success → `OK WROTE BLOCK=<b> DATA=<hex32>` (same framing as `WRITE_BLOCK`).
+- `WRITE_TRAILER <trailerBlock> <hex32> KEY=<hex12>` writes a sector trailer. Non-trailer → `ERR NOT_A_TRAILER`; self-inconsistent access bits (bytes 6–8) → `ERR TRAILER_BAD_ACCESS_BITS`. Success → `OK WROTE_TRAILER BLOCK=<b>`, with ` WARN=ZERO_KEYA` appended if the incoming Key A region is all-zero.
+
+### WRITE_PAGE_RAW (magic NTAG)
+
+`WRITE_PAGE_RAW <page> <hex8>` allows pages `0`–`2` (for magic-UID rewrites) but refuses page `3` (`ERR REFUSE_PAGE_OTP`) and a cascade tag at page 1 byte 0 = `0x88` (`ERR REFUSE_UL_CASCADE_BYTE`). Success → `OK WROTE_PAGE PAGE=<p> DATA=<hex8>`. (The safe `WRITE_PAGE` command, which refuses pages 0–3, is unchanged.)
+
+### ATS / APDU (ISO-14443-4)
+
+- `ATS` → `OK ATS=<hex> HISTBYTES=<hex|->` (or `ERR NO_ATS` / `ERR WRONG_CARD_TYPE`).
+- `APDU <hexCAPDU>` performs a single T=CL exchange → `OK APDU RESP=<hex> SW=<hex4|->`. Requests or responses over 60 bytes → `ERR APDU_TOO_LONG`; transport failure → `ERR APDU <statusName>`.
+
+### Honest limits
+
+- **DESFire, EMV payment cards, transit cards, and phones cannot be cloned** by this firmware — they use cryptographic authentication this tool does not implement.
+- **Sectors whose keys are not in the dictionary are unreadable** — `CLONE_READ` marks them `STATUS=FAILED` and emits no block data.
+- **A normal (non-magic) card's UID cannot be changed.** Block 0 is read-only on standard cards; only Gen1a/Gen2 "magic" cards accept a new UID.
+- **Gen1a magic is 4-byte-UID only.** Writing a 7-byte UID requires a Gen2 (direct-write) magic card.
+- Cloning copies data only — it does not defeat any access control that relies on cryptographic challenge/response.
 
 ## Useful test block
 

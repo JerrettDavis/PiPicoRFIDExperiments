@@ -2,6 +2,7 @@ import './style.css';
 import { createTransport } from './serial/transport.js';
 import { MockSerialTransport, type MockCardKind } from './serial/mockPico.js';
 import { RfidController } from './controller.js';
+import { CloneController } from './clone.js';
 import { cleanHex, trailerForBlock } from './protocol.js';
 import { confirmWrite } from './confirm.js';
 import { AutoReader } from './autoread.js';
@@ -14,6 +15,14 @@ import {
   clearWriteError,
   renderPageWriteError,
   clearPageWriteError,
+  renderCloneImage,
+  renderCloneTarget,
+  renderCloneProgress,
+  renderCloneSummary,
+  renderCloneError,
+  renderKeyDictStatus,
+  renderAts,
+  renderApduResponse,
   appendLog,
   clearLog,
   getConnectBtn,
@@ -26,6 +35,9 @@ import {
   getRescanInput,
   getRawInput,
   getAutoReadToggle,
+  getCloneImportInput,
+  getKeyDictToggle,
+  getApduInput,
 } from './ui.js';
 
 declare global {
@@ -59,6 +71,84 @@ autoReadToggle.addEventListener('change', () => {
   renderAutoReadState(autoReadToggle.checked);
 });
 
+// ── Clone workflow ─────────────────────────────────────────────────────────────
+
+const cloneController = new CloneController({
+  controller,
+  onProgress: (done, total) => renderCloneProgress(done, total),
+  onLog: (line) => appendLog(line, 'tx'),
+});
+
+getKeyDictToggle().addEventListener('change', () => {
+  renderKeyDictStatus(getKeyDictToggle().checked);
+});
+
+document.getElementById('cloneRead')?.addEventListener('click', async () => {
+  const result = await cloneController.readSource();
+  if (result.ok && result.image) {
+    renderCloneImage(result.image);
+  } else {
+    renderCloneError(`Read failed: ${result.error ?? 'unknown'}`);
+  }
+});
+
+document.getElementById('cloneDetect')?.addEventListener('click', async () => {
+  const { scan, blocked } = await cloneController.detectTarget();
+  const target = cloneController.target;
+  const magic = cloneController.targetMagic;
+  if (target) {
+    const familyMatch = !blocked;
+    renderCloneTarget(target, magic, familyMatch);
+  } else {
+    renderCloneError(`Detect failed: ${scan.error ?? 'no card'}`);
+  }
+});
+
+document.getElementById('cloneWrite')?.addEventListener('click', async () => {
+  // Re-validate target/source presence.
+  if (!cloneController.image) { renderCloneError('Read a source image first.'); return; }
+  if (!cloneController.target) { renderCloneError('Detect a target first.'); return; }
+  const summary = await cloneController.writeClone();
+  if (summary === null) {
+    // Cancelled at confirm → nothing written.
+    return;
+  }
+  renderCloneSummary(summary);
+});
+
+document.getElementById('cloneExport')?.addEventListener('click', () => {
+  const json = cloneController.exportJson();
+  getCloneImportInput().value = json;
+  appendLog('Exported image JSON to import box.');
+});
+
+document.getElementById('cloneImport')?.addEventListener('click', () => {
+  try {
+    const image = cloneController.importJson(getCloneImportInput().value);
+    renderCloneImage(image);
+    appendLog('Imported image JSON.');
+  } catch (err) {
+    renderCloneError(`Import failed: ${String(err)}`);
+  }
+});
+
+// ── ISO4 identify (ATS / APDU) ────────────────────────────────────────────────
+
+document.getElementById('atsRead')?.addEventListener('click', async () => {
+  appendLog('ATS', 'tx');
+  const result = await controller.ats();
+  if (result.ok && result.ats) renderAts(result.ats);
+  renderOpResult(result);
+});
+
+document.getElementById('apduSend')?.addEventListener('click', async () => {
+  const hex = cleanHex(getApduInput().value);
+  appendLog(`APDU ${hex}`, 'tx');
+  const result = await controller.apdu(hex);
+  if (result.ok && result.apdu) renderApduResponse(result.apdu);
+  renderOpResult(result);
+});
+
 // ── Transport events ──────────────────────────────────────────────────────────
 
 transport.onStatus(connected => {
@@ -69,6 +159,7 @@ transport.onStatus(connected => {
     void applyRescan();
   } else {
     autoReader.reset();
+    cloneController.reset();
   }
 });
 
@@ -227,6 +318,21 @@ async function sendRaw(raw: string): Promise<void> {
   if (!trimmed) return;
 
   const upper = trimmed.toUpperCase();
+
+  // Refuse bulk-destructive raw ops so they cannot bypass confirmClone.
+  // (Single WRITE_BLOCK / WRITE_PAGE below still route through confirmWrite.)
+  if (
+    upper.startsWith('WRITE_BLOCK_RAW') ||
+    upper.startsWith('WRITE_TRAILER') ||
+    upper.startsWith('WRITE_PAGE_RAW') ||
+    upper.startsWith('CLONE_UID')
+  ) {
+    const msg = 'Bulk/raw write commands are disabled here — use the Clone panel.';
+    renderWriteError(msg);
+    appendLog(`Refused raw command "${trimmed.split(/\s+/)[0]}" — use the Clone panel.`);
+    return;
+  }
+
   if (upper.startsWith('WRITE_BLOCK')) {
     const parts = trimmed.split(/\s+/);
     const block = parseInt(parts[1] ?? '0', 10);

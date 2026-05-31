@@ -184,3 +184,202 @@ export async function confirmWrite(opts: ConfirmWriteOptions): Promise<boolean> 
     document.addEventListener('keydown', onKeyDown);
   });
 }
+
+// ── v0.3: clone-specific two-step confirmation ────────────────────────────────
+
+export interface ConfirmCloneOptions {
+  sourceUid: string;
+  targetUid: string;
+  family: string;
+  blockOrPageCount: number;
+  uidWillClone: boolean;
+  uidMethod: string;
+  warnings: string[];
+}
+
+/**
+ * Two-step confirmation specific to the bulk CLONE write. Distinct modal/testids
+ * from confirmWrite (which is left byte-identical). Step 1: acknowledge. Step 2:
+ * type the literal word `CLONE`. Resolves true only after both steps pass.
+ */
+export async function confirmClone(opts: ConfirmCloneOptions): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.style.cssText = `
+      position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 1000;
+    `;
+
+    const modal = document.createElement('div');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('data-testid', 'clone-confirm-modal');
+    modal.style.cssText = `
+      background: var(--panel); border: 1px solid var(--border);
+      border-radius: 16px; padding: 24px; max-width: 520px; width: 92%;
+      box-shadow: 0 20px 60px rgba(0,0,0,.4);
+    `;
+
+    function onKeyDown(ev: KeyboardEvent): void {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        close(false);
+      }
+    }
+
+    function close(result: boolean): void {
+      document.removeEventListener('keydown', onKeyDown);
+      overlay.remove();
+      resolve(result);
+    }
+
+    function summaryBlock(): HTMLElement {
+      const info = document.createElement('div');
+      info.style.cssText = 'margin-bottom: 16px; font-size: 14px; line-height: 1.6;';
+
+      const mk = (label: string, value: string): HTMLParagraphElement => {
+        const p = document.createElement('p');
+        p.style.cssText = 'margin: 0 0 6px;';
+        const s = document.createElement('strong');
+        s.textContent = `${label}: `;
+        p.appendChild(s);
+        p.append(value);
+        return p;
+      };
+
+      info.appendChild(mk('Source UID', opts.sourceUid));
+      info.appendChild(mk('Target UID', opts.targetUid));
+      info.appendChild(mk('Family', opts.family));
+      info.appendChild(mk(opts.family === 'ULTRALIGHT' ? 'Pages to write' : 'Blocks to write',
+        String(opts.blockOrPageCount)));
+      info.appendChild(mk('UID clone',
+        opts.uidWillClone ? `YES (${opts.uidMethod})` : `NO (${opts.uidMethod})`));
+
+      if (opts.warnings.length) {
+        const w = document.createElement('p');
+        w.style.cssText = 'margin: 8px 0 0; color: var(--danger);';
+        w.textContent = `Warnings: ${opts.warnings.join('; ')}`;
+        info.appendChild(w);
+      }
+      return info;
+    }
+
+    function renderStep1(): void {
+      modal.replaceChildren();
+      modal.setAttribute('data-step', '1');
+
+      const title = document.createElement('h2');
+      title.style.cssText = 'margin: 0 0 12px; color: var(--danger); font-size: 18px;';
+      title.textContent = 'Confirm Clone — Step 1 of 2';
+
+      modal.appendChild(title);
+      modal.appendChild(summaryBlock());
+
+      const warning = document.createElement('p');
+      warning.style.cssText = 'margin: 0 0 16px; color: var(--danger); font-weight: 600;';
+      warning.textContent = '⚠ This overwrites the target card in bulk. This cannot be undone.';
+      modal.appendChild(warning);
+
+      const ackLabel = document.createElement('label');
+      ackLabel.style.cssText = 'display: flex; align-items: flex-start; gap: 10px; cursor: pointer; margin-bottom: 20px; font-size: 14px;';
+
+      const ackCheckbox = document.createElement('input');
+      ackCheckbox.type = 'checkbox';
+      ackCheckbox.setAttribute('data-testid', 'clone-confirm-ack');
+      ackCheckbox.style.cssText = 'margin-top: 2px; width: auto; flex-shrink: 0;';
+
+      const ackText = document.createElement('span');
+      ackText.textContent = 'I understand this bulk-overwrites the target card';
+
+      ackLabel.appendChild(ackCheckbox);
+      ackLabel.appendChild(ackText);
+      modal.appendChild(ackLabel);
+
+      const btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display: flex; gap: 8px; justify-content: flex-end;';
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.setAttribute('data-testid', 'clone-confirm-cancel');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.cssText = 'padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--input); color: var(--text); cursor: pointer; font-weight: 600;';
+      cancelBtn.addEventListener('click', () => close(false));
+
+      const continueBtn = document.createElement('button');
+      continueBtn.setAttribute('data-testid', 'clone-confirm-step1');
+      continueBtn.textContent = 'Continue →';
+      continueBtn.disabled = true;
+      continueBtn.style.cssText = 'padding: 10px 16px; border-radius: 10px; border: none; background: var(--accent); color: white; cursor: pointer; font-weight: 600;';
+      continueBtn.addEventListener('click', () => renderStep2());
+
+      ackCheckbox.addEventListener('change', () => {
+        continueBtn.disabled = !ackCheckbox.checked;
+      });
+
+      btnRow.appendChild(cancelBtn);
+      btnRow.appendChild(continueBtn);
+      modal.appendChild(btnRow);
+    }
+
+    function renderStep2(): void {
+      modal.replaceChildren();
+      modal.setAttribute('data-step', '2');
+
+      const container = document.createElement('div');
+      container.setAttribute('data-testid', 'clone-confirm-step2-container');
+
+      const title = document.createElement('h2');
+      title.style.cssText = 'margin: 0 0 12px; color: var(--danger); font-size: 18px;';
+      title.textContent = 'Confirm Clone — Step 2 of 2';
+
+      const instruction = document.createElement('p');
+      instruction.style.cssText = 'margin: 0 0 16px; font-size: 14px;';
+      instruction.append('Type ');
+      const word = document.createElement('strong');
+      word.textContent = 'CLONE';
+      instruction.appendChild(word);
+      instruction.append(' to confirm the bulk write:');
+
+      const typeInput = document.createElement('input');
+      typeInput.setAttribute('data-testid', 'clone-confirm-type');
+      typeInput.type = 'text';
+      typeInput.setAttribute('autocomplete', 'off');
+      typeInput.placeholder = 'CLONE';
+      typeInput.style.cssText = 'width: 100%; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--input); color: var(--text); font: inherit; margin-bottom: 20px;';
+
+      const btnRow = document.createElement('div');
+      btnRow.style.cssText = 'display: flex; gap: 8px; justify-content: flex-end;';
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.setAttribute('data-testid', 'clone-confirm-cancel');
+      cancelBtn.textContent = 'Cancel';
+      cancelBtn.style.cssText = 'padding: 10px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--input); color: var(--text); cursor: pointer; font-weight: 600;';
+      cancelBtn.addEventListener('click', () => close(false));
+
+      const cloneBtn = document.createElement('button');
+      cloneBtn.setAttribute('data-testid', 'clone-confirm-step2');
+      cloneBtn.textContent = 'Clone Now';
+      cloneBtn.disabled = true;
+      cloneBtn.style.cssText = 'padding: 10px 16px; border-radius: 10px; border: none; background: var(--danger); color: white; cursor: pointer; font-weight: 600;';
+      cloneBtn.addEventListener('click', () => close(true));
+
+      typeInput.addEventListener('input', () => {
+        cloneBtn.disabled = typeInput.value !== 'CLONE';
+      });
+
+      btnRow.appendChild(cancelBtn);
+      btnRow.appendChild(cloneBtn);
+
+      container.appendChild(title);
+      container.appendChild(instruction);
+      container.appendChild(typeInput);
+      container.appendChild(btnRow);
+      modal.appendChild(container);
+    }
+
+    renderStep1();
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+    document.addEventListener('keydown', onKeyDown);
+  });
+}
