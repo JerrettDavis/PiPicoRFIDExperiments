@@ -1,0 +1,19 @@
+{
+  "name": "pi-pico-rfid-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview --port 4188 --strictPort --base /PiPicoRFIDExperiments/",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "@playwright/test": "^1.49.0",
+    "@types/w3c-web-serial": "^1.0.7"
+  }
+}
