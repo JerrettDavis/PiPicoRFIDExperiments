@@ -190,6 +190,8 @@ export function deriveBlock0(image: CardImage): string | undefined {
   const uid = cleanHex(image.uid);
   if (uid.length === 8) {
     const bcc = bccClassic(uid);
+    // Normalize SAK to a single byte: strip non-hex (drops the "0x" prefix) and
+    // take the last 2 hex chars; default to 08 (MIFARE 1K) when absent.
     const sak = cleanHex(image.sak).slice(-2).padStart(2, '0') || '08';
     let b0 = uid + bcc + sak;
     b0 = (b0 + '0'.repeat(32)).slice(0, 32);
@@ -324,7 +326,7 @@ export function parseLine(line: string): ParsedResponse {
   if (trimmed.startsWith('EVENT ')) {
     return { kind: 'event', raw: line, payload: trimmed.slice(6) };
   }
-  if (trimmed.startsWith('BLOCK=')) {
+  if (trimmed.startsWith('BLOCK=') || trimmed.startsWith('SECTOR=') || trimmed.startsWith('PAGE=')) {
     return { kind: 'data', raw: line, payload: trimmed };
   }
   if (trimmed.startsWith('READY') || trimmed.startsWith('PINS ')) {

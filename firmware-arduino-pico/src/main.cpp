@@ -191,6 +191,7 @@ static void printHelp() {
   Serial.println("  READ_PAGE/WRITE_PAGE target Ultralight/NTAG (no auth); WRITE_PAGE refuses pages 0-3");
   Serial.println("  CLONE_READ dumps all readable sectors using a built-in key dictionary");
   Serial.println("  MAGIC_DETECT/CLONE_UID need magic (Gen1a/Gen2) cards; normal UIDs are unchangeable");
+  Serial.println("  CLONE_UID supports 4-byte UID targets only (Gen1a and Gen2); 7-byte UIDs rejected");
   Serial.println("  WRITE_PAGE_RAW allows pages 0-2 (magic NTAG); refuses page 3 OTP and cascade byte");
   Serial.println("  ATS/APDU target ISO-14443-4 cards; APDU req/resp limited to 60 bytes");
 }
@@ -771,7 +772,17 @@ static void cloneReadClassic() {
       Serial.print("------------");
       Serial.println(" KEYTYPE=NONE STATUS=FAILED");
       failedSectors++;
-      continue;  // No block lines for a failed sector.
+      // Emit one BLOCK=<b> ERR=AUTH_FAILED line per block of the failed sector
+      // so the host (web image/panel + e2e test) sees the failed blocks on real
+      // hardware, matching the mock. No data is read (auth never succeeded).
+      byte ffirst = firstBlockOfSector(s);
+      byte fcount = blocksInSector(s);
+      for (byte b = ffirst; b < ffirst + fcount; b++) {
+        Serial.print("BLOCK=");
+        Serial.print(b);
+        Serial.println(" ERR=AUTH_FAILED");
+      }
+      continue;
     }
 
     okSectors++;
@@ -986,6 +997,16 @@ static void commandCloneUid(const String& block0Hex, const String& method) {
       m = detectGen2Writable() ? "GEN2" : "NORMAL";
       selectCard();
     }
+  }
+
+  // M3: the BCC check above and the block-0 write assume a 4-byte UID. The
+  // GEN1A path refuses 7-byte UIDs with its own message; guard the GEN2/DIRECT
+  // path here too. A 7-byte UID block 0 has a different layout (cascade byte +
+  // two partial BCCs) that we do not support, so reject before any write.
+  if ((m == "GEN2" || m == "DIRECT") && rfid.uid.size != 4) {
+    Serial.println("ERR CLONE_UID_7BYTE_NOT_SUPPORTED");
+    rfid.PICC_HaltA();
+    return;
   }
 
   if (m == "NORMAL") {

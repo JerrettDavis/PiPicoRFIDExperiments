@@ -167,7 +167,7 @@ BLOCK=<b> DATA=<hex32>        # one line per readable block (or BLOCK=<b> ERR=<r
 OK CLONE_END OK_SECTORS=<n> FAILED_SECTORS=<n>
 ```
 
-A sector whose key is not in the dictionary emits its `SECTOR=` line with `KEY=------------ KEYTYPE=NONE STATUS=FAILED` and **no** block lines. Trailer blocks are included (the Key A region reads back as zeros — expected). **Ultralight/NTAG** cards are dispatched to the `CLONE_READ_UL` framing below. **ISO-14443-4 / unknown** → `ERR CLONE_UNSUPPORTED TYPE=<TOKEN>`.
+A sector whose key is not in the dictionary emits its `SECTOR=` line with `KEY=------------ KEYTYPE=NONE STATUS=FAILED`, followed by one `BLOCK=<b> ERR=AUTH_FAILED` line for **every** block in that sector (so the host renders the failed blocks the same way on real hardware as in the mock). Trailer blocks are included on readable sectors (the Key A region reads back as zeros — expected). **Ultralight/NTAG** cards are dispatched to the `CLONE_READ_UL` framing below. **ISO-14443-4 / unknown** → `ERR CLONE_UNSUPPORTED TYPE=<TOKEN>`.
 
 ### CLONE_READ_UL — full Ultralight/NTAG page dump
 
@@ -192,8 +192,9 @@ Never alters data (Gen2 / Ultralight tests write existing bytes back unchanged).
 
 `CLONE_UID <block0hex32> METHOD=<GEN1A|GEN2|AUTO>`. The 32 hex chars are the full 16-byte block 0; the firmware validates the 4-byte BCC (`block0[4] == uid0^uid1^uid2^uid3`):
 
-- BCC mismatch → `ERR CLONE_UID_BAD_BCC EXPECTED=0x<NN> GOT=0x<NN>`
-- `GEN1A`: opens the Gen1a backdoor and writes block 0 (4-byte UID only; a 7-byte UID → `ERR CLONE_UID_GEN1A_4BYTE_ONLY`)
+- **4-byte UID targets only.** `CLONE_UID` rejects 7-byte-UID cards on every path: the GEN1A path replies `ERR CLONE_UID_GEN1A_4BYTE_ONLY`, and the GEN2/DIRECT (and AUTO→GEN2) path replies `ERR CLONE_UID_7BYTE_NOT_SUPPORTED`. (A 7-byte UID block 0 has a different layout — cascade byte plus two partial BCCs — that is not yet supported.)
+- BCC mismatch → `ERR CLONE_UID_BAD_BCC EXPECTED=0x<NN> GOT=0x<NN>` (the BCC is `block0[4] == uid0^uid1^uid2^uid3` for the 4-byte UID)
+- `GEN1A`: opens the Gen1a backdoor and writes block 0
 - `GEN2`/`DIRECT`: dictionary-auths sector 0 and writes block 0 directly
 - `AUTO`: runs the `MAGIC_DETECT` logic and picks the method
 - Success → `OK CLONE_UID METHOD=<GEN1A|GEN2> UID=<newUidHex>`
@@ -218,7 +219,7 @@ Never alters data (Gen2 / Ultralight tests write existing bytes back unchanged).
 - **DESFire, EMV payment cards, transit cards, and phones cannot be cloned** by this firmware — they use cryptographic authentication this tool does not implement.
 - **Sectors whose keys are not in the dictionary are unreadable** — `CLONE_READ` marks them `STATUS=FAILED` and emits no block data.
 - **A normal (non-magic) card's UID cannot be changed.** Block 0 is read-only on standard cards; only Gen1a/Gen2 "magic" cards accept a new UID.
-- **Gen1a magic is 4-byte-UID only.** Writing a 7-byte UID requires a Gen2 (direct-write) magic card.
+- **`CLONE_UID` writes 4-byte UIDs only.** Both the Gen1a and the Gen2/direct paths reject 7-byte-UID targets (the 7-byte block-0 layout — cascade byte + partial BCCs — is not yet supported).
 - Cloning copies data only — it does not defeat any access control that relies on cryptographic challenge/response.
 
 ## Useful test block
