@@ -27,6 +27,76 @@ String lastUid;
 unsigned long lastPollMs = 0;
 bool cardPresent = false;
 
+// --- Onboard LED indicator (local-only; does not affect serial protocol) ---
+// Non-blocking state machine: on the edge a card newly appears we run a short
+// blink burst, then hold the LED solid ON while the card stays present, and
+// turn it OFF once the card is gone. All timing is millis()-based so the serial
+// command handling and the RC522 poll cadence are never stalled.
+static constexpr uint8_t  LED_BLINK_COUNT    = 3;    // quick blinks on detection edge
+static constexpr unsigned long LED_BLINK_MS  = 80;   // per on/off phase duration (ms)
+
+// Debounced presence used ONLY to drive the LED edges. We cannot trust a single
+// poll's PICC_IsNewCardPresent() for the "card gone" decision: the poll halts
+// the card after reading it (PICC_HaltA), so a card that is still physically on
+// the antenna is not reported as "new" every poll and a single absent reading is
+// normal. To avoid LED flicker we require LED_ABSENT_DEBOUNCE consecutive absent
+// polls before declaring the card removed. This state is local to the LED and
+// never affects the EVENT CARD_PRESENT text or any command response.
+static constexpr uint8_t LED_ABSENT_DEBOUNCE = 3;    // consecutive absent polls = gone
+static bool ledPresent = false;                      // debounced presence for the LED
+static uint8_t ledAbsentCount = 0;                   // consecutive absent-poll counter
+
+enum class LedMode { Off, BlinkBurst, SolidOn };
+static LedMode ledMode = LedMode::Off;
+static bool ledOn = false;             // current physical LED state
+static uint8_t ledBlinkPhase = 0;      // counts on/off phases during the burst
+static unsigned long ledPhaseStartMs = 0;
+
+static void ledWrite(bool on) {
+  ledOn = on;
+  digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
+}
+
+// Called from pollCardEvents() once per poll with whether a card is present now.
+static void ledOnCardState(bool present) {
+  if (present) {
+    // Rising edge: card newly present -> start the distinctive blink burst.
+    if (ledMode == LedMode::Off) {
+      ledMode = LedMode::BlinkBurst;
+      ledBlinkPhase = 0;
+      ledPhaseStartMs = millis();
+      ledWrite(true);  // start burst with LED on
+    }
+    // If already blinking or solid-on, leave the state machine running.
+  } else {
+    // Falling edge: card gone -> LED off.
+    if (ledMode != LedMode::Off) {
+      ledMode = LedMode::Off;
+      ledWrite(false);
+    }
+  }
+}
+
+// Non-blocking LED tick: advances the blink burst, then settles to solid ON.
+// Safe to call every loop iteration; does nothing unless a phase has elapsed.
+static void ledUpdate() {
+  if (ledMode != LedMode::BlinkBurst) return;
+
+  unsigned long now = millis();
+  if (now - ledPhaseStartMs < LED_BLINK_MS) return;
+  ledPhaseStartMs = now;
+
+  ledBlinkPhase++;
+  // A full blink = on phase + off phase = 2 phases. After LED_BLINK_COUNT
+  // blinks (2*count phases) the burst is done and the LED stays solid ON.
+  if (ledBlinkPhase >= (uint8_t)(LED_BLINK_COUNT * 2)) {
+    ledMode = LedMode::SolidOn;
+    ledWrite(true);
+    return;
+  }
+  ledWrite(!ledOn);  // toggle for the next blink phase
+}
+
 static String statusName(MFRC522::StatusCode status) {
   return String(rfid.GetStatusCodeName(status));
 }
@@ -420,16 +490,41 @@ static void pollCardEvents() {
       Serial.print("EVENT CARD_PRESENT UID=");
       Serial.println(uid);
     }
+    // Local LED indicator (debounced). A card was read this poll, so it is
+    // present: clear the absent counter and, on the rising edge of the debounced
+    // presence, start the blink burst. Does not alter serial output.
+    ledAbsentCount = 0;
+    if (!ledPresent) {
+      ledPresent = true;
+      ledOnCardState(true);
+    }
     rfid.PICC_HaltA();
     stopCardCrypto();
   } else {
     // Very lightweight absence detection. It won't be perfect, but it avoids spamming.
     // Manual SCAN remains authoritative.
+    // Local LED indicator (debounced): a single absent poll is NOT enough to
+    // declare the card gone, because the card is halted after each read and so
+    // is not reported as "new" every poll. Only after LED_ABSENT_DEBOUNCE
+    // consecutive absent polls do we treat the card as removed and turn the LED
+    // off. NOTE: we deliberately do NOT touch `cardPresent` here, so the
+    // EVENT CARD_PRESENT emission behavior stays byte-identical to the original.
+    if (ledPresent) {
+      if (ledAbsentCount < LED_ABSENT_DEBOUNCE) ledAbsentCount++;
+      if (ledAbsentCount >= LED_ABSENT_DEBOUNCE) {
+        ledPresent = false;
+        ledOnCardState(false);
+      }
+    }
   }
 }
 
 void setup() {
   pinMode(PIN_RFID_IRQ, INPUT_PULLUP);
+
+  // Onboard LED (GPIO 25 on a plain Pico) used as a local card-detect indicator.
+  pinMode(LED_BUILTIN, OUTPUT);
+  ledWrite(false);
 
   Serial.begin(115200);
   unsigned long start = millis();
@@ -454,5 +549,6 @@ void setup() {
 void loop() {
   readSerialCommands();
   pollCardEvents();
+  ledUpdate();  // non-blocking: advances the LED blink burst when active
   delay(2);
 }

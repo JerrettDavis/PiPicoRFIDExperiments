@@ -92,6 +92,16 @@ export function buildDOM(): void {
   const readBtn = btn('readBlock', 'btn-read', 'Read Block');
   const dumpBtn = btn('dumpSector', 'btn-dump', 'Dump Sector');
   const rwBtns = div({ class: 'buttons' }, readBtn, dumpBtn);
+
+  // Auto-read toggle (near the action buttons)
+  const autoReadCheckbox = make('input', { id: 'autoRead', 'data-testid': 'toggle-autoread', type: 'checkbox' });
+  autoReadCheckbox.style.cssText = 'width: auto; flex: 0 0 auto; margin: 0;';
+  const autoReadText = make('span', {});
+  autoReadText.textContent = 'Auto-read on detect';
+  const autoReadLabel = make('label', { id: 'autoReadLabel', for: 'autoRead' });
+  autoReadLabel.style.cssText = 'display: flex; align-items: center; gap: 8px; margin: 12px 0 0; cursor: pointer; color: var(--text);';
+  autoReadLabel.append(autoReadCheckbox, autoReadText);
+
   const opBadge = div({ id: 'opBadge' });
 
   const dataArea = make('textarea', { id: 'data', 'data-testid': 'input-data' });
@@ -121,6 +131,7 @@ export function buildDOM(): void {
     lbl('key', 'Key A hex (default: FFFFFFFFFFFF)'),
     keyInput,
     rwBtns,
+    autoReadLabel,
     opBadge,
     lbl('data', '16 bytes / 32 hex chars to write'),
     dataArea,
@@ -160,7 +171,15 @@ export function getBlockInput(): HTMLInputElement { return elById('block'); }
 export function getKeyInput(): HTMLInputElement { return elById('key'); }
 export function getDataInput(): HTMLTextAreaElement { return elById('data'); }
 export function getRawInput(): HTMLInputElement { return elById('raw'); }
+export function getAutoReadToggle(): HTMLInputElement { return elById('autoRead'); }
 export function getLogEl(): HTMLElement { return elById('log'); }
+
+// Reflect the auto-read toggle state visually (highlight the label when ON).
+export function renderAutoReadState(on: boolean): void {
+  const label = elById('autoReadLabel');
+  label.style.color = on ? 'var(--accent)' : 'var(--text)';
+  label.style.fontWeight = on ? '650' : '400';
+}
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 

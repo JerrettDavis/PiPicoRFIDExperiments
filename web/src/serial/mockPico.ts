@@ -146,4 +146,13 @@ export class MockSerialTransport implements SerialTransport {
   async send(command: string): Promise<void> {
     setTimeout(() => this.pico.handle(command), 0);
   }
+
+  /**
+   * Test-only: inject an unsolicited `EVENT CARD_PRESENT UID=<uid>` line
+   * through the same path the firmware would use. Used to drive auto-read /
+   * debounce tests deterministically. Mock transport only.
+   */
+  emitCardPresent(uid: string): void {
+    this.emitLine(`EVENT CARD_PRESENT UID=${uid}`);
+  }
 }

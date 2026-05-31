@@ -1,12 +1,15 @@
 import './style.css';
 import { createTransport } from './serial/transport.js';
+import { MockSerialTransport } from './serial/mockPico.js';
 import { RfidController } from './controller.js';
 import { cleanHex } from './protocol.js';
 import { confirmWrite } from './confirm.js';
+import { AutoReader } from './autoread.js';
 import {
   buildDOM,
   renderStatus,
   renderOpResult,
+  renderAutoReadState,
   renderWriteError,
   clearWriteError,
   appendLog,
@@ -17,18 +20,44 @@ import {
   getKeyInput,
   getDataInput,
   getRawInput,
+  getAutoReadToggle,
 } from './ui.js';
+
+declare global {
+  interface Window {
+    __mockEmitCardPresent?: (uid: string) => void;
+  }
+}
 
 buildDOM();
 
 const transport = createTransport();
 const controller = new RfidController(transport);
 
+// ── Auto-read ─────────────────────────────────────────────────────────────────
+
+const autoReader = new AutoReader({
+  controller,
+  isEnabled: () => getAutoReadToggle().checked,
+  getBlock: () => parseInt(getBlockInput().value, 10),
+  getKey: () => getKeyInput().value,
+  onResult: (result) => renderOpResult(result),
+  onLog: (line) => appendLog(line, 'tx'),
+});
+
+const autoReadToggle = getAutoReadToggle();
+autoReadToggle.checked = false; // default OFF
+renderAutoReadState(false);
+autoReadToggle.addEventListener('change', () => {
+  renderAutoReadState(autoReadToggle.checked);
+});
+
 // ── Transport events ──────────────────────────────────────────────────────────
 
 transport.onStatus(connected => {
   renderStatus(connected);
   appendLog(connected ? 'Connected' : 'Disconnected');
+  if (!connected) autoReader.reset();
 });
 
 transport.onLine(line => {
@@ -36,9 +65,16 @@ transport.onLine(line => {
 });
 
 controller.onEvent(line => {
-  // Events are already logged via onLine; no extra action needed here
-  void line;
+  // Unsolicited events (e.g. EVENT CARD_PRESENT) drive auto-read.
+  autoReader.handleLine(line);
 });
+
+// ── Mock-only test hook for injecting CARD_PRESENT events ─────────────────────
+
+if (transport instanceof MockSerialTransport) {
+  const mock = transport;
+  window.__mockEmitCardPresent = (uid: string) => mock.emitCardPresent(uid);
+}
 
 // ── Connection buttons ────────────────────────────────────────────────────────
 
