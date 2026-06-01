@@ -42,6 +42,35 @@ test('Click memmap-edit-4 → Edit tab with block 4 prefilled → two-step confi
   await expect(page.getByTestId('memmap-hex-4')).toContainText('AA BB CC DD');
 });
 
+test('ASCII view: from-map edit prefills HEX and the sent WRITE command is hex-only (not ASCII)', async ({ page }) => {
+  await gotoConnected(page);
+  await readClassicMap(page);
+
+  // Toggle the map to ASCII display.
+  await page.getByTestId('toggle-hexascii').click();
+  await expect(page.getByTestId('toggle-hexascii')).toHaveAttribute('aria-pressed', 'true');
+  // Block 4 ASCII cell shows the decoded message...
+  await expect(page.getByTestId('memmap-ascii-4')).toContainText('Hello from Pico!');
+
+  // ...but a from-map edit prefills the HEX into the editor, not the ASCII.
+  await page.getByTestId('memmap-edit-4').click();
+  await expect(page.getByTestId('panel-edit')).toBeVisible();
+  await expect(page.getByTestId('input-data')).toHaveValue('48656C6C6F2066726F6D205069636F21');
+
+  // Complete the two-step confirm (unchanged data) and assert the SENT command
+  // carries the original HEX bytes, never the ASCII string.
+  await page.getByTestId('btn-write').click();
+  await page.getByTestId('confirm-ack').check();
+  await page.getByTestId('confirm-step1').click();
+  await expect(page.getByTestId('write-confirm-step2')).toBeVisible({ timeout: 2000 });
+  await page.getByTestId('confirm-type').fill('4');
+  await page.getByTestId('confirm-step2').click();
+
+  const log = page.getByTestId('log');
+  await expect(log).toContainText('WRITE_BLOCK 4 48656C6C6F2066726F6D205069636F21', { timeout: 3000 });
+  await expect(log).not.toContainText('Hello from Pico!');
+});
+
 test('memmap-edit-0 (manufacturer) and a trailer edit button are disabled (never reach the editor)', async ({ page }) => {
   await gotoConnected(page);
   await readClassicMap(page);

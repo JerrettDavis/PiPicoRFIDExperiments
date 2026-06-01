@@ -60,9 +60,10 @@ static constexpr uint8_t LED_ABSENT_DEBOUNCE = 3;    // consecutive absent polls
 static bool ledPresent = false;                      // debounced presence for the LED
 static uint8_t ledAbsentCount = 0;                   // consecutive absent-poll counter
 
-// Transient SCAN flash overlay: while now < ledFlashUntilMs the LED shows the
-// OPPOSITE of its resting state, then snaps back to resting.
-static unsigned long ledFlashUntilMs = 0;
+// Transient SCAN flash overlay: for LED_FLASH_MS after ledFlashStartMs the LED
+// shows the OPPOSITE of its resting state, then snaps back to resting. Timed via
+// rollover-safe unsigned elapsed-time subtraction (not an absolute deadline).
+static unsigned long ledFlashStartMs = 0;
 
 static void ledWrite(bool on) {
   digitalWrite(LED_BUILTIN, on ? HIGH : LOW);
@@ -98,14 +99,16 @@ static void ledOnCardState(bool present) {
 // restores the resting state. No card + SCAN -> blink on then off; card present
 // + SCAN -> blink off then back to solid on.
 static void ledFlashScan() {
-  ledFlashUntilMs = millis() + LED_FLASH_MS;
+  ledFlashStartMs = millis();
   ledWrite(!ledRestingState());  // immediately show the inverted (flash) level
 }
 
 // Non-blocking LED tick: applies the flash overlay if active, else the resting
-// state. Safe to call every loop iteration.
+// state. Safe to call every loop iteration. The elapsed-time test
+// (now - start < dur) on unsigned millis() is rollover-safe across the 49.7-day
+// wrap, unlike an absolute (now < deadline) comparison.
 static void ledUpdate() {
-  if (millis() < ledFlashUntilMs) {
+  if (millis() - ledFlashStartMs < LED_FLASH_MS) {
     ledWrite(!ledRestingState());  // flash overlay active
   } else {
     ledWrite(ledRestingState());   // resting: ON if card present, else OFF
@@ -1602,6 +1605,9 @@ void setup() {
   // Onboard LED (GPIO 25 on a plain Pico) used as a local card-detect indicator.
   pinMode(LED_BUILTIN, OUTPUT);
   ledWrite(false);
+  // Mark the flash overlay as already expired so no spurious flash fires before
+  // the first SCAN (millis() starts near 0, so leave a full window behind us).
+  ledFlashStartMs = millis() - LED_FLASH_MS;
 
   Serial.begin(115200);
   unsigned long start = millis();

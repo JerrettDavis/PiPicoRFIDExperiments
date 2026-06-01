@@ -177,6 +177,7 @@ test('Raw bulk-destructive commands are refused (no confirmClone bypass)', async
   for (const cmd of [
     'WRITE_BLOCK_RAW 4 AABBCCDD11223344AABBCCDD11223344 KEY=FFFFFFFFFFFF',
     'WRITE_TRAILER 7 FFFFFFFFFFFFFF078069FFFFFFFFFFFF KEY=FFFFFFFFFFFF',
+    'WRITE_PAGE_RAW 4 AABBCCDD',
     'CLONE_UID DEADBEEF5508000000000000000000000 METHOD=GEN2',
   ]) {
     await page.getByTestId('input-raw').fill(cmd);

@@ -228,6 +228,8 @@ getMemmapContainer().addEventListener('click', (ev) => {
 interface EditRequest { kind: 'block' | 'page'; addr: number; hex: string; key?: string }
 
 document.addEventListener('rfid:edit-request', (ev) => {
+  // Guard: a stray/programmatic event while disconnected must not prefill the editor.
+  if (!tabs.isEnabled('edit')) return;
   const detail = (ev as CustomEvent<EditRequest>).detail;
   tabs.show('edit');
   if (detail.kind === 'block') {
