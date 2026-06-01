@@ -45,13 +45,12 @@ h1 { margin: 0 0 6px; font-size: 24px; }
 header p { margin: 0; color: var(--muted); }
 
 main {
-  display: grid;
-  grid-template-columns: minmax(320px, 460px) minmax(380px, 1fr);
-  gap: 16px;
   padding: 16px;
-  max-width: 1300px;
+  max-width: 1100px;
   margin: 0 auto;
 }
+
+main.tabbed { display: block; }
 
 section {
   background: var(--panel);
@@ -59,6 +58,50 @@ section {
   border-radius: 16px;
   padding: 16px;
   box-shadow: 0 10px 28px rgba(0, 0, 0, .12);
+}
+
+/* ── Header bar ──────────────────────────────────────────────────────────── */
+.header-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+.header-bar .status { margin-left: auto; }
+.card-chip {
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+/* ── Tab bar ─────────────────────────────────────────────────────────────── */
+.tabbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 16px 0;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+.tabbar [role="tab"] {
+  border-radius: 10px 10px 0 0;
+  border-bottom: 2px solid transparent;
+}
+.tabbar [role="tab"].active {
+  background: var(--panel);
+  border-color: var(--border);
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+[role="tabpanel"] { margin-top: 0; }
+[role="tabpanel"][hidden] { display: none; }
+
+@media (max-width: 880px) {
+  .tabbar { padding: 8px 8px 0; }
 }
 
 h2 { margin: 0 0 12px; font-size: 18px; }
@@ -164,6 +207,43 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 
 @media (max-width: 880px) {
-  main { grid-template-columns: 1fr; }
   #log { height: 420px; }
+}
+
+/* ── Memory map ──────────────────────────────────────────────────────────── */
+.memmap-container { margin-top: 12px; max-height: 520px; overflow: auto; }
+
+table.memmap {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 12px;
+}
+table.memmap td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.memmap-sector-head td {
+  background: var(--input);
+  font-weight: 700;
+  color: var(--muted);
+}
+.memmap tr.failed,
+.memmap tr.failed td,
+.memmap .memmap-err,
+.memmap-sector-head.failed td {
+  color: var(--danger);
+}
+.memmap code { font-family: inherit; }
+
+/* Hex/ASCII display toggle: only one of .hex/.ascii visible per mode. */
+table.memmap .ascii { display: none; }
+table.memmap.memmap--ascii .hex { display: none; }
+table.memmap.memmap--ascii .ascii { display: inline; }
+
+.memmap-summary {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--muted);
 }

@@ -3,9 +3,16 @@ import { createTransport } from './serial/transport.js';
 import { MockSerialTransport, type MockCardKind } from './serial/mockPico.js';
 import { RfidController } from './controller.js';
 import { CloneController } from './clone.js';
-import { cleanHex, trailerForBlock } from './protocol.js';
-import { confirmWrite } from './confirm.js';
+import { EditController } from './edit.js';
+import { createTabs, type TabId } from './tabs.js';
+import { cleanHex } from './protocol.js';
 import { AutoReader } from './autoread.js';
+import {
+  getViewMode, setViewMode, type ViewMode,
+} from './format.js';
+import {
+  renderMemoryMap, updateUnit, keyForBlock, dataForUnit,
+} from './memorymap.js';
 import {
   buildDOM,
   renderStatus,
@@ -15,6 +22,7 @@ import {
   clearWriteError,
   renderPageWriteError,
   clearPageWriteError,
+  renderConsoleError,
   renderCloneImage,
   renderCloneTarget,
   renderCloneProgress,
@@ -38,6 +46,8 @@ import {
   getCloneImportInput,
   getKeyDictToggle,
   getApduInput,
+  getMemmapContainer,
+  getHexAsciiToggle,
 } from './ui.js';
 
 declare global {
@@ -51,6 +61,33 @@ buildDOM();
 
 const transport = createTransport();
 const controller = new RfidController(transport);
+const tabs = createTabs();
+
+// Tabs requiring a connection.
+const CONN_TABS: TabId[] = ['read', 'edit', 'clone', 'identify'];
+
+// ── View mode (hex/ascii) ─────────────────────────────────────────────────────
+
+let viewMode: ViewMode = getViewMode();
+let lastImage: import('./types.js').CardImage | null = null;
+
+function applyHexAsciiToggleUi(): void {
+  const t = getHexAsciiToggle();
+  t.setAttribute('aria-pressed', viewMode === 'ascii' ? 'true' : 'false');
+}
+
+// ── Edit controller (SINGLE write path) ───────────────────────────────────────
+
+const editController = new EditController({
+  controller,
+  onLog: (line) => appendLog(line, 'tx'),
+  onResult: (result) => renderOpResult(result),
+  renderWriteError,
+  clearWriteError,
+  renderPageWriteError,
+  clearPageWriteError,
+  onWritten: (_kind, addr, hex) => updateUnit(addr, hex),
+});
 
 // ── Auto-read ─────────────────────────────────────────────────────────────────
 
@@ -105,14 +142,10 @@ document.getElementById('cloneDetect')?.addEventListener('click', async () => {
 });
 
 document.getElementById('cloneWrite')?.addEventListener('click', async () => {
-  // Re-validate target/source presence.
   if (!cloneController.image) { renderCloneError('Read a source image first.'); return; }
   if (!cloneController.target) { renderCloneError('Detect a target first.'); return; }
   const summary = await cloneController.writeClone();
-  if (summary === null) {
-    // Cancelled at confirm → nothing written.
-    return;
-  }
+  if (summary === null) return; // cancelled → nothing written
   renderCloneSummary(summary);
 });
 
@@ -149,17 +182,80 @@ document.getElementById('apduSend')?.addEventListener('click', async () => {
   renderOpResult(result);
 });
 
+// ── Full memory map (Read tab) ────────────────────────────────────────────────
+
+document.getElementById('readFullMap')?.addEventListener('click', async () => {
+  appendLog('CLONE_READ (full map)', 'tx');
+  const result = await controller.cloneRead();
+  if (result.ok && result.image) {
+    lastImage = result.image;
+    renderMemoryMap(getMemmapContainer(), result.image, viewMode);
+  } else {
+    renderOpResult(result);
+  }
+});
+
+getHexAsciiToggle().addEventListener('click', () => {
+  viewMode = viewMode === 'hex' ? 'ascii' : 'hex';
+  setViewMode(viewMode);
+  applyHexAsciiToggleUi();
+  // Flip the table class (display-only); re-render to be safe for new maps.
+  const table = getMemmapContainer().querySelector<HTMLElement>('[data-testid="memmap"]');
+  if (table) table.classList.toggle('memmap--ascii', viewMode === 'ascii');
+  else if (lastImage) renderMemoryMap(getMemmapContainer(), lastImage, viewMode);
+});
+applyHexAsciiToggleUi();
+
+// ── From-map edit requests ─────────────────────────────────────────────────────
+
+getMemmapContainer().addEventListener('click', (ev) => {
+  const target = ev.target as HTMLElement;
+  const editBtn = target.closest<HTMLButtonElement>('button[data-block]');
+  if (!editBtn || editBtn.disabled) return;
+  const testid = editBtn.getAttribute('data-testid') ?? '';
+  const addr = parseInt(editBtn.getAttribute('data-block') ?? '', 10);
+  if (Number.isNaN(addr)) return;
+  const isPage = testid.startsWith('memmap-edit-page-');
+  const hex = dataForUnit(addr, isPage) ?? '';
+  const detail: EditRequest = { kind: isPage ? 'page' : 'block', addr, hex };
+  if (!isPage) {
+    const k = keyForBlock(addr);
+    if (k) detail.key = k;
+  }
+  document.dispatchEvent(new CustomEvent<EditRequest>('rfid:edit-request', { detail }));
+});
+
+interface EditRequest { kind: 'block' | 'page'; addr: number; hex: string; key?: string }
+
+document.addEventListener('rfid:edit-request', (ev) => {
+  const detail = (ev as CustomEvent<EditRequest>).detail;
+  tabs.show('edit');
+  if (detail.kind === 'block') {
+    getBlockInput().value = String(detail.addr);
+    if (detail.key) getKeyInput().value = detail.key;
+    if (detail.hex) getDataInput().value = detail.hex;
+    getDataInput().focus();
+  } else {
+    getPageInput().value = String(detail.addr);
+    if (detail.hex) getPageDataInput().value = detail.hex;
+    getPageDataInput().focus();
+  }
+});
+
 // ── Transport events ──────────────────────────────────────────────────────────
 
 transport.onStatus(connected => {
   renderStatus(connected);
   appendLog(connected ? 'Connected' : 'Disconnected');
+  // Enable/disable connection-only tabs.
+  for (const t of CONN_TABS) tabs.setEnabled(t, connected);
   if (connected) {
-    // Push the current re-scan interval to the firmware on connect.
     void applyRescan();
   } else {
     autoReader.reset();
     cloneController.reset();
+    // If the active tab is now disabled, fall back to Console.
+    if (CONN_TABS.includes(tabs.active())) tabs.show('console');
   }
 });
 
@@ -168,7 +264,6 @@ transport.onLine(line => {
 });
 
 controller.onEvent(line => {
-  // Unsolicited events (e.g. EVENT CARD_PRESENT) drive auto-read.
   autoReader.handleLine(line);
 });
 
@@ -225,7 +320,7 @@ document.querySelectorAll<HTMLButtonElement>('[data-cmd]').forEach(btn => {
   });
 });
 
-// ── Read / Dump ───────────────────────────────────────────────────────────────
+// ── Single read / dump (Edit tab) ─────────────────────────────────────────────
 
 document.getElementById('readBlock')?.addEventListener('click', async () => {
   const block = parseInt(getBlockInput().value, 10);
@@ -243,41 +338,6 @@ document.getElementById('dumpSector')?.addEventListener('click', async () => {
   renderOpResult(result);
 });
 
-// ── Write (two-step confirm) ──────────────────────────────────────────────────
-
-async function doWrite(block: number, hex: string, key: string): Promise<void> {
-  // Pre-validate before opening modal
-  if (block === 0) {
-    renderWriteError('Block 0 is protected (UID/manufacturer data).');
-    return;
-  }
-  if (trailerForBlock(block) === block) {
-    renderWriteError(`Block ${block} is a sector trailer — writes refused.`);
-    return;
-  }
-  if (hex.length !== 32) {
-    renderWriteError(`Data must be exactly 32 hex chars (got ${hex.length}).`);
-    return;
-  }
-  clearWriteError();
-
-  const confirmed = await confirmWrite({ block, data: hex, key });
-  if (!confirmed) return;
-
-  appendLog(`WRITE_BLOCK ${block} ${hex} ${key}`.trim(), 'tx');
-  const result = await controller.writeBlock(block, hex, key || undefined);
-  renderOpResult(result);
-}
-
-document.getElementById('writeBlock')?.addEventListener('click', async () => {
-  const block = parseInt(getBlockInput().value, 10);
-  const hex = cleanHex(getDataInput().value);
-  const key = cleanHex(getKeyInput().value);
-  await doWrite(block, hex, key);
-});
-
-// ── Ultralight page read / write ──────────────────────────────────────────────
-
 document.getElementById('readPage')?.addEventListener('click', async () => {
   const page = parseInt(getPageInput().value, 10);
   appendLog(`READ_PAGE ${page}`, 'tx');
@@ -285,33 +345,40 @@ document.getElementById('readPage')?.addEventListener('click', async () => {
   renderOpResult(result);
 });
 
-// WRITE_PAGE goes through the SAME two-step confirmation as WRITE_BLOCK.
-async function doWritePage(page: number, hex: string): Promise<void> {
-  if (page <= 3) {
-    renderPageWriteError(`Page ${page} is protected (pages 0–3) — writes refused.`);
-    return;
-  }
-  if (hex.length !== 8) {
-    renderPageWriteError(`Data must be exactly 8 hex chars / 4 bytes (got ${hex.length}).`);
-    return;
-  }
-  clearPageWriteError();
-
-  const confirmed = await confirmWrite({ block: page, data: hex, key: '', unit: 'page' });
-  if (!confirmed) return;
-
-  appendLog(`WRITE_PAGE ${page} ${hex}`, 'tx');
-  const result = await controller.writePage(page, hex);
+// "Read into editor" prefills the editor textarea with the current value.
+document.getElementById('editRead')?.addEventListener('click', async () => {
+  const block = parseInt(getBlockInput().value, 10);
+  const key = cleanHex(getKeyInput().value);
+  appendLog(`READ_BLOCK ${block} ${key}`.trim(), 'tx');
+  const result = await controller.readBlock(block, key || undefined);
   renderOpResult(result);
-}
+  if (result.ok && result.block) getDataInput().value = cleanHex(result.block.data);
+});
+
+document.getElementById('editReadPage')?.addEventListener('click', async () => {
+  const page = parseInt(getPageInput().value, 10);
+  appendLog(`READ_PAGE ${page}`, 'tx');
+  const result = await controller.readPage(page);
+  renderOpResult(result);
+  if (result.ok && result.page) getPageDataInput().value = cleanHex(result.page.data);
+});
+
+// ── Write (Edit tab) — SINGLE write path via EditController ────────────────────
+
+document.getElementById('writeBlock')?.addEventListener('click', async () => {
+  const block = parseInt(getBlockInput().value, 10);
+  const hex = cleanHex(getDataInput().value);
+  const key = cleanHex(getKeyInput().value);
+  await editController.writeBlock(block, hex, key);
+});
 
 document.getElementById('writePage')?.addEventListener('click', async () => {
   const page = parseInt(getPageInput().value, 10);
   const hex = cleanHex(getPageDataInput().value);
-  await doWritePage(page, hex);
+  await editController.writePage(page, hex);
 });
 
-// ── Raw command (intercepts WRITE_BLOCK) ─────────────────────────────────────
+// ── Raw command (Console) ─────────────────────────────────────────────────────
 
 async function sendRaw(raw: string): Promise<void> {
   const trimmed = raw.trim();
@@ -329,6 +396,7 @@ async function sendRaw(raw: string): Promise<void> {
   ) {
     const msg = 'Bulk/raw write commands are disabled here — use the Clone panel.';
     renderWriteError(msg);
+    renderConsoleError(msg);
     appendLog(`Refused raw command "${trimmed.split(/\s+/)[0]}" — use the Clone panel.`);
     return;
   }
@@ -338,14 +406,14 @@ async function sendRaw(raw: string): Promise<void> {
     const block = parseInt(parts[1] ?? '0', 10);
     const hex = cleanHex(parts[2] ?? '');
     const key = cleanHex(parts[3] ?? '');
-    await doWrite(block, hex, key);
+    await editController.writeBlock(block, hex, key);
     return;
   }
   if (upper.startsWith('WRITE_PAGE')) {
     const parts = trimmed.split(/\s+/);
     const page = parseInt(parts[1] ?? '0', 10);
     const hex = cleanHex(parts[2] ?? '');
-    await doWritePage(page, hex);
+    await editController.writePage(page, hex);
     return;
   }
 
