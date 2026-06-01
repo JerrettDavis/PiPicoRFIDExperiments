@@ -20,6 +20,10 @@ static constexpr uint8_t PIN_SPI_MOSI = 19;
 static constexpr uint8_t PIN_RFID_RST = 20;
 static constexpr uint8_t PIN_RFID_IRQ = 21;
 
+// Buzzer on GP15 (free pin: does not collide with RC522 GP16-21 or LED GP25).
+// Passive piezo or active buzzer driven via the Arduino tone()/noTone() API.
+static constexpr uint8_t PIN_BUZZER = 15;
+
 // v0.3: MFRC522Extended is a drop-in subclass of MFRC522 — all existing
 // MFRC522:: enums/constants and Classic/Ultralight calls keep working, and we
 // additionally gain PICC_RequestATS / TCL_Transceive / MIFARE_OpenUidBackdoor /
@@ -74,12 +78,52 @@ static bool ledRestingState() {
   return ledPresent;
 }
 
+// --- Buzzer (GP15) — non-blocking beep state machine -----------------------
+// Uses the Arduino tone()/noTone() API (Earle Philhower core), which works for
+// both passive piezo and active buzzers. tone() starts a continuous tone on its
+// own PWM/timer; we stop it from beepUpdate() once the duration elapses, so the
+// main loop is never blocked (no tone() duration arg, no delay()).
+static constexpr unsigned     BEEP_FREQ_HZ = 2700;  // default beep frequency (Hz)
+static constexpr unsigned long BEEP_MS     = 120;   // default beep duration (ms)
+
+static bool buzzerEnabled = true;          // default ON; gates the intake beep
+static bool beeping = false;               // a beep is currently sounding
+static unsigned long beepStartMs = 0;      // when the current beep started
+static unsigned long beepDurMs = 0;        // current beep duration
+
+// Start a beep (non-blocking). The intake path passes through buzzerEnabled; the
+// manual BEEP test command bypasses the gate by calling tone() through here only
+// after deciding to fire, so callers that must always beep can set the flag — to
+// keep it simple, the gate is checked by callers (onCardIntake) while BEEP fires
+// unconditionally. Here we only honor buzzerEnabled for consistency with intake.
+static void beepStartGated(unsigned freq, unsigned long ms, bool force) {
+  if (!force && !buzzerEnabled) return;
+  tone(PIN_BUZZER, freq);
+  beepStartMs = millis();
+  beepDurMs = ms;
+  beeping = true;
+}
+
+// Convenience: respects buzzerEnabled (used by the card-intake hook).
+static void beepStart(unsigned freq, unsigned long ms) {
+  beepStartGated(freq, ms, false);
+}
+
+// Non-blocking buzzer tick: stop the tone once the duration has elapsed. The
+// unsigned elapsed-time test is rollover-safe. Call every loop().
+static void beepUpdate() {
+  if (beeping && (millis() - beepStartMs >= beepDurMs)) {
+    noTone(PIN_BUZZER);
+    beeping = false;
+  }
+}
+
 // Future-proof hook: called exactly once on the genuine card-detection RISING
 // edge (the same edge where ledPresent transitions false -> true). Central place
-// to add a speaker beep later. For now it just guarantees the LED solid-on.
+// for intake feedback: LED solid-on plus a single beep (gated by buzzerEnabled).
 static void onCardIntake() {
-  // TODO: speaker beep on intake
-  ledWrite(true);  // card just arrived -> resting state is ON
+  ledWrite(true);                    // card just arrived -> resting state is ON
+  beepStart(BEEP_FREQ_HZ, BEEP_MS);  // one beep per genuine detection (gated)
 }
 
 // Called from pollCardEvents() on debounced presence edges.
@@ -171,6 +215,8 @@ static void printHelp() {
   Serial.println("OK COMMANDS");
   Serial.println("  PING");
   Serial.println("  VERSION");
+  Serial.println("  BUZZER [ON|OFF]");
+  Serial.println("  BEEP [<freq> <ms>]");
   Serial.println("  RESCAN [ms]");
   Serial.println("  SCAN");
   Serial.println("  READ_BLOCK <block> [keyAhex12]");
@@ -197,6 +243,8 @@ static void printHelp() {
   Serial.println("  CLONE_UID supports 4-byte UID targets only (Gen1a and Gen2); 7-byte UIDs rejected");
   Serial.println("  WRITE_PAGE_RAW allows pages 0-2 (magic NTAG); refuses page 3 OTP and cascade byte");
   Serial.println("  ATS/APDU target ISO-14443-4 cards; APDU req/resp limited to 60 bytes");
+  Serial.println("  BUZZER ON|OFF gates the per-detection beep (default ON); BEEP is a manual test");
+  Serial.println("  Buzzer is on GP15; BEEP fires even when BUZZER is OFF");
 }
 
 static bool selectCard() {
@@ -433,6 +481,52 @@ static bool detectGen2Writable() {
 
 static void commandPing() {
   Serial.println("OK PONG");
+}
+
+// BUZZER ON|OFF sets the intake-beep gate; BUZZER (no arg) queries it.
+static void commandBuzzer(const String& arg) {
+  String a = arg;
+  a.trim();
+  a.toUpperCase();
+  if (a.length() == 0) {
+    Serial.println(buzzerEnabled ? "OK BUZZER ON" : "OK BUZZER OFF");
+    return;
+  }
+  if (a == "ON") {
+    buzzerEnabled = true;
+    Serial.println("OK BUZZER ON");
+  } else if (a == "OFF") {
+    buzzerEnabled = false;
+    Serial.println("OK BUZZER OFF");
+  } else {
+    Serial.println("ERR USAGE BUZZER [ON|OFF]");
+  }
+}
+
+// BEEP fires a manual test beep at defaults, or BEEP <freq> <ms> at the given
+// values (validated). The test beep fires even when buzzerEnabled is OFF.
+static void commandBeep(const String& freqStr, const String& msStr) {
+  unsigned freq = BEEP_FREQ_HZ;
+  unsigned long ms = BEEP_MS;
+  if (freqStr.length() > 0 || msStr.length() > 0) {
+    if (freqStr.length() == 0 || msStr.length() == 0) {
+      Serial.println("ERR BAD_BEEP");
+      return;
+    }
+    long f = freqStr.toInt();
+    long m = msStr.toInt();
+    if (f < 100 || f > 10000 || m < 1 || m > 2000) {
+      Serial.println("ERR BAD_BEEP");
+      return;
+    }
+    freq = (unsigned)f;
+    ms = (unsigned long)m;
+  }
+  beepStartGated(freq, ms, true);  // force: explicit manual test ignores the gate
+  Serial.print("OK BEEP ");
+  Serial.print(freq);
+  Serial.print(' ');
+  Serial.println(ms);
 }
 
 static void commandVersion() {
@@ -1364,6 +1458,13 @@ static void handleCommand(String line) {
     printHelp();
   } else if (cmd == "VERSION") {
     commandVersion();
+  } else if (cmd == "BUZZER") {
+    String arg = nextToken(rest);
+    commandBuzzer(arg);
+  } else if (cmd == "BEEP") {
+    String freqStr = nextToken(rest);
+    String msStr = nextToken(rest);
+    commandBeep(freqStr, msStr);
   } else if (cmd == "RESCAN") {
     String msStr = nextToken(rest);
     if (msStr.length() == 0) {
@@ -1632,6 +1733,7 @@ void setup() {
 void loop() {
   readSerialCommands();
   pollCardEvents();
-  ledUpdate();  // non-blocking: applies SCAN flash overlay or resting state
+  ledUpdate();   // non-blocking: applies SCAN flash overlay or resting state
+  beepUpdate();  // non-blocking: stops the buzzer tone when its duration elapses
   delay(2);
 }

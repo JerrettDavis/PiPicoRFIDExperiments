@@ -130,6 +130,18 @@ function buildReadPanel(): HTMLElement {
   autoReadLabel.style.cssText = 'display: flex; align-items: center; gap: 8px; margin: 12px 0 0; cursor: pointer; color: var(--text);';
   autoReadLabel.append(autoReadCheckbox, autoReadText);
 
+  // Buzzer: "Beep on detect" toggle (default ON) + a Test Beep button.
+  const buzzerCheckbox = make('input', { id: 'buzzer', 'data-testid': 'toggle-buzzer', type: 'checkbox' });
+  buzzerCheckbox.style.cssText = 'width: auto; flex: 0 0 auto; margin: 0;';
+  buzzerCheckbox.checked = true;
+  const buzzerText = make('span', {});
+  buzzerText.textContent = 'Beep on detect';
+  const buzzerLabel = make('label', { id: 'buzzerLabel', for: 'buzzer' });
+  buzzerLabel.style.cssText = 'display: flex; align-items: center; gap: 8px; margin: 12px 0 0; cursor: pointer; color: var(--text);';
+  buzzerLabel.append(buzzerCheckbox, buzzerText);
+  const testBeepBtn = btn('testBeep', 'btn-beep', 'Test Beep');
+  const beepRow = div({ class: 'buttons' }, testBeepBtn);
+
   // RESCAN control.
   const rescanInput = inputEl('rescan', 'input-rescan', 'number', '0');
   rescanInput.min = '0';
@@ -155,6 +167,8 @@ function buildReadPanel(): HTMLElement {
     make('h2', {}, 'Read'),
     quickBtns,
     autoReadLabel,
+    buzzerLabel,
+    beepRow,
     lbl('rescan', 'Re-scan interval (ms) — 0 disables'),
     rescanRow,
     mapBtns,
@@ -389,6 +403,7 @@ export function getPageDataInput(): HTMLTextAreaElement { return elById('pageDat
 export function getRescanInput(): HTMLInputElement { return elById('rescan'); }
 export function getRawInput(): HTMLInputElement { return elById('raw'); }
 export function getAutoReadToggle(): HTMLInputElement { return elById('autoRead'); }
+export function getBuzzerToggle(): HTMLInputElement { return elById('buzzer'); }
 export function getLogEl(): HTMLElement { return elById('log'); }
 export function getCloneImportInput(): HTMLTextAreaElement { return elById('cloneImportInput'); }
 export function getKeyDictToggle(): HTMLInputElement { return elById('keyDict'); }
@@ -399,6 +414,13 @@ export function getHexAsciiToggle(): HTMLButtonElement { return elById('hexAscii
 // Reflect the auto-read toggle state visually (highlight the label when ON).
 export function renderAutoReadState(on: boolean): void {
   const label = elById('autoReadLabel');
+  label.style.color = on ? 'var(--accent)' : 'var(--text)';
+  label.style.fontWeight = on ? '650' : '400';
+}
+
+// Reflect the buzzer toggle state visually (highlight the label when ON).
+export function renderBuzzerState(on: boolean): void {
+  const label = elById('buzzerLabel');
   label.style.color = on ? 'var(--accent)' : 'var(--text)';
   label.style.fontWeight = on ? '650' : '400';
 }

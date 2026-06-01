@@ -91,6 +91,20 @@ export function buildApdu(hex: string): string {
   return `APDU ${cleanHex(hex)}`;
 }
 
+// v0.4 — buzzer / beep
+export function buildBuzzer(on: boolean): string {
+  return `BUZZER ${on ? 'ON' : 'OFF'}`;
+}
+
+export function buildBuzzerQuery(): string {
+  return 'BUZZER';
+}
+
+export function buildBeep(freq?: number, ms?: number): string {
+  if (freq !== undefined && ms !== undefined) return `BEEP ${freq} ${ms}`;
+  return 'BEEP';
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 export function cleanHex(s: string): string {

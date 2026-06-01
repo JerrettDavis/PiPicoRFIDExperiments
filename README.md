@@ -87,6 +87,8 @@ Commands are newline-terminated ASCII.
 PING
 VERSION
 HELP
+BUZZER [ON|OFF]
+BEEP [<freq> <ms>]
 RESCAN [ms]
 SCAN
 READ_BLOCK <block> [keyAhex12]
@@ -109,7 +111,19 @@ APDU <hexCAPDU>
 
 `RESCAN <ms>` sets a re-scan interval and replies `OK RESCAN <ms>`. `RESCAN` with no argument queries the current value and replies `OK RESCAN <current_ms>`. The default on boot is `0` (disabled).
 
-When `ms > 0`, the firmware re-emits `EVENT CARD_PRESENT UID=<uid>` every `<ms>` milliseconds for as long as the **same** card stays continuously present, letting the host periodically re-read it. When `ms = 0` the behavior is the original one: `EVENT CARD_PRESENT` is emitted once per physical insertion. The onboard LED only runs its blink burst on a genuinely new insertion — periodic re-emits keep the LED solid-on without re-blinking.
+When `ms > 0`, the firmware re-emits `EVENT CARD_PRESENT UID=<uid>` every `<ms>` milliseconds for as long as the **same** card stays continuously present, letting the host periodically re-read it. When `ms = 0` the behavior is the original one: `EVENT CARD_PRESENT` is emitted once per physical insertion. Periodic re-emits do not re-trigger the card-intake feedback (the buzzer beeps and the LED switches to solid-on only on a genuinely new insertion).
+
+### BUZZER / BEEP — audible feedback (GP15)
+
+An optional passive piezo or active buzzer on **GP15** beeps once on each genuine card detection (the same rising edge that turns the LED solid-on). Driven non-blocking via the Arduino `tone()`/`noTone()` API; default beep is 2700 Hz for 120 ms.
+
+- `BUZZER ON` / `BUZZER OFF` enables/disables the per-detection beep → `OK BUZZER ON` / `OK BUZZER OFF`. The buzzer is **ON by default**.
+- `BUZZER` (no argument) queries the current state → `OK BUZZER ON|OFF`.
+- `BEEP` fires a manual test beep at the defaults → `OK BEEP 2700 120`.
+- `BEEP <freq> <ms>` beeps at the given frequency (Hz) and duration (ms) → `OK BEEP <freq> <ms>`. Valid ranges are freq `100`–`10000`, ms `1`–`2000`; out-of-range or partial arguments → `ERR BAD_BEEP`.
+- The manual `BEEP` test fires even when `BUZZER` is `OFF`.
+
+Wiring: buzzer **+** to **GP15**, buzzer **−** to **GND** (add a series resistor / transistor driver for a loud active buzzer as needed). GP15 is free — it does not collide with the RC522 pins (GP16–21) or the onboard LED (GP25).
 
 ### Card-type awareness
 

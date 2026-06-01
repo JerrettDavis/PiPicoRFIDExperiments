@@ -119,6 +119,10 @@ export interface OpResult {
   ats?: AtsInfo;
   /** APDU exchange result (APDU command). */
   apdu?: ApduResult;
+  /** Buzzer state confirmed by the firmware (BUZZER command/query). */
+  buzzer?: { enabled: boolean };
+  /** Beep parameters confirmed by the firmware (BEEP command). */
+  beep?: { freq: number; ms: number };
   error?: string;
 }
 

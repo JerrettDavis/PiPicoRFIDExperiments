@@ -62,6 +62,8 @@ class MockPico {
   private rescanMs = 0;
   private rescanTimer: ReturnType<typeof setInterval> | null = null;
   private destroyed = false;
+  /** Buzzer enabled state (default ON, matching firmware). */
+  private buzzerOn = true;
 
   private emitLine: (line: string) => void;
 
@@ -179,7 +181,7 @@ class MockPico {
         break;
 
       case 'HELP':
-        this.emit('OK COMMANDS PING VERSION HELP SCAN READ_BLOCK WRITE_BLOCK READ_PAGE WRITE_PAGE DUMP RESCAN CLONE_READ CLONE_READ_UL MAGIC_DETECT CLONE_UID WRITE_BLOCK_RAW WRITE_TRAILER WRITE_PAGE_RAW ATS APDU');
+        this.emit('OK COMMANDS PING VERSION HELP SCAN READ_BLOCK WRITE_BLOCK READ_PAGE WRITE_PAGE DUMP RESCAN CLONE_READ CLONE_READ_UL MAGIC_DETECT CLONE_UID WRITE_BLOCK_RAW WRITE_TRAILER WRITE_PAGE_RAW ATS APDU BUZZER BEEP');
         break;
 
       case 'SCAN':
@@ -196,6 +198,31 @@ class MockPico {
           this.rescanMs = Number.isFinite(ms) && ms >= 0 ? ms : 0;
           this.emit(`OK RESCAN ${this.rescanMs}`);
           this.startRescan();
+        }
+        break;
+      }
+
+      case 'BUZZER': {
+        const arg = (parts[1] ?? '').toUpperCase();
+        if (arg === '') {
+          // Query.
+          this.emit(`OK BUZZER ${this.buzzerOn ? 'ON' : 'OFF'}`);
+        } else if (arg === 'ON' || arg === 'OFF') {
+          this.buzzerOn = arg === 'ON';
+          this.emit(`OK BUZZER ${arg}`);
+        } else {
+          this.emit('ERR UNKNOWN_COMMAND BUZZER');
+        }
+        break;
+      }
+
+      case 'BEEP': {
+        const freq = parts[1] !== undefined ? parseInt(parts[1], 10) : 2700;
+        const ms = parts[2] !== undefined ? parseInt(parts[2], 10) : 120;
+        if (!Number.isFinite(freq) || !Number.isFinite(ms) || freq <= 0 || ms <= 0) {
+          this.emit('ERR BAD_BEEP');
+        } else {
+          this.emit(`OK BEEP ${freq} ${ms}`);
         }
         break;
       }

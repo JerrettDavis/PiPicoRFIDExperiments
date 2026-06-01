@@ -8,6 +8,7 @@ import {
   buildReadPage, buildWritePage, buildRescan, buildRescanQuery,
   buildCloneRead, buildCloneReadUl, buildMagicDetect, buildCloneUid,
   buildWriteBlockRaw, buildWriteTrailer, buildWritePageRaw, buildAts, buildApdu,
+  buildBuzzer, buildBuzzerQuery, buildBeep,
   cleanHex, sectorRange,
 } from './protocol.js';
 
@@ -125,6 +126,16 @@ export class RfidController {
     }
     if (payload.startsWith('APDU ')) {
       return { ok: true, raw, apdu: parseApdu(payload) };
+    }
+    // Parse BUZZER response: `BUZZER ON|OFF`.
+    const buzzerMatch = payload.match(/^BUZZER\s+(ON|OFF)\b/);
+    if (buzzerMatch) {
+      return { ok: true, raw, buzzer: { enabled: buzzerMatch[1] === 'ON' } };
+    }
+    // Parse BEEP response: `BEEP <freq> <ms>`.
+    const beepMatch = payload.match(/^BEEP\s+(\d+)\s+(\d+)/);
+    if (beepMatch) {
+      return { ok: true, raw, beep: { freq: parseInt(beepMatch[1]!, 10), ms: parseInt(beepMatch[2]!, 10) } };
     }
     // CLONE_UID: `CLONE_UID METHOD=<GEN1A|GEN2> UID=<hex>` — surface card UID.
     if (payload.startsWith('CLONE_UID ')) {
@@ -334,5 +345,19 @@ export class RfidController {
 
   async apdu(hex: string): Promise<OpResult> {
     return this.sendCommand(buildApdu(hex));
+  }
+
+  // ── v0.4: buzzer / beep ──────────────────────────────────────────────────────
+
+  async setBuzzer(on: boolean): Promise<OpResult> {
+    return this.sendCommand(buildBuzzer(on));
+  }
+
+  async buzzerQuery(): Promise<OpResult> {
+    return this.sendCommand(buildBuzzerQuery());
+  }
+
+  async beep(freq?: number, ms?: number): Promise<OpResult> {
+    return this.sendCommand(buildBeep(freq, ms));
   }
 }

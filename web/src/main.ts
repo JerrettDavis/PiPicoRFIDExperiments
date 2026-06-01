@@ -18,6 +18,7 @@ import {
   renderStatus,
   renderOpResult,
   renderAutoReadState,
+  renderBuzzerState,
   renderWriteError,
   clearWriteError,
   renderPageWriteError,
@@ -43,6 +44,7 @@ import {
   getRescanInput,
   getRawInput,
   getAutoReadToggle,
+  getBuzzerToggle,
   getCloneImportInput,
   getKeyDictToggle,
   getApduInput,
@@ -106,6 +108,30 @@ autoReadToggle.checked = false; // default OFF
 renderAutoReadState(false);
 autoReadToggle.addEventListener('change', () => {
   renderAutoReadState(autoReadToggle.checked);
+});
+
+// ── Buzzer / beep ──────────────────────────────────────────────────────────────
+
+const buzzerToggle = getBuzzerToggle();
+buzzerToggle.checked = true; // default ON (matches firmware default)
+renderBuzzerState(true);
+
+async function applyBuzzer(): Promise<void> {
+  const on = buzzerToggle.checked;
+  appendLog(`BUZZER ${on ? 'ON' : 'OFF'}`, 'tx');
+  const result = await controller.setBuzzer(on);
+  renderOpResult(result);
+}
+
+buzzerToggle.addEventListener('change', () => {
+  renderBuzzerState(buzzerToggle.checked);
+  applyBuzzer().catch(err => appendLog(String(err)));
+});
+
+document.getElementById('testBeep')?.addEventListener('click', async () => {
+  appendLog('BEEP', 'tx');
+  const result = await controller.beep();
+  renderOpResult(result);
 });
 
 // ── Clone workflow ─────────────────────────────────────────────────────────────
@@ -253,6 +279,8 @@ transport.onStatus(connected => {
   for (const t of CONN_TABS) tabs.setEnabled(t, connected);
   if (connected) {
     void applyRescan();
+    // Push the current buzzer toggle state so the firmware matches the UI.
+    void applyBuzzer();
   } else {
     autoReader.reset();
     cloneController.reset();
