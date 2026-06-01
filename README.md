@@ -89,6 +89,7 @@ VERSION
 HELP
 BUZZER [ON|OFF]
 BEEP [<freq> <ms>]
+BEEPCFG [<freq> <ms>]
 RESCAN [ms]
 SCAN
 READ_BLOCK <block> [keyAhex12]
@@ -115,15 +116,19 @@ When `ms > 0`, the firmware re-emits `EVENT CARD_PRESENT UID=<uid>` every `<ms>`
 
 ### BUZZER / BEEP — audible feedback (GP15)
 
-An optional passive piezo or active buzzer on **GP15** beeps once on each genuine card detection (the same rising edge that turns the LED solid-on). Driven non-blocking via the Arduino `tone()`/`noTone()` API; default beep is 2700 Hz for 120 ms.
+An optional passive piezo or active buzzer on **GP15** beeps once on each genuine card detection (the same rising edge that turns the LED solid-on). Driven non-blocking via the Arduino `tone()`/`noTone()` API. The on-detect beep defaults to **1500 Hz for 200 ms** and is live-tunable via `BEEPCFG`.
 
 - `BUZZER ON` / `BUZZER OFF` enables/disables the per-detection beep → `OK BUZZER ON` / `OK BUZZER OFF`. The buzzer is **ON by default**.
 - `BUZZER` (no argument) queries the current state → `OK BUZZER ON|OFF`.
-- `BEEP` fires a manual test beep at the defaults → `OK BEEP 2700 120`.
-- `BEEP <freq> <ms>` beeps at the given frequency (Hz) and duration (ms) → `OK BEEP <freq> <ms>`. Valid ranges are freq `100`–`10000`, ms `1`–`2000`; out-of-range or partial arguments → `ERR BAD_BEEP`.
+- `BEEP` (no arguments) plays the currently configured on-detect beep as a test → `OK BEEP <freq> <ms>`.
+- `BEEP <freq> <ms>` does a one-off override beep at the given frequency (Hz) and duration (ms) → `OK BEEP <freq> <ms>`.
+- `BEEPCFG <freq> <ms>` sets the on-detect beep parameters → `OK BEEPCFG <freq> <ms>`. `BEEPCFG` (no arguments) queries them → `OK BEEPCFG <freq> <ms>` (does not play a sound).
+- Valid ranges (for both `BEEP` and `BEEPCFG`) are freq `100`–`10000`, ms `1`–`2000`; out-of-range or partial arguments → `ERR BAD_BEEP`.
 - The manual `BEEP` test fires even when `BUZZER` is `OFF`.
 
-Wiring: buzzer **+** to **GP15**, buzzer **−** to **GND** (add a series resistor / transistor driver for a loud active buzzer as needed). GP15 is free — it does not collide with the RC522 pins (GP16–21) or the onboard LED (GP25).
+Wiring: buzzer **+** to **GP15**, buzzer **−** to **GND**. GP15 is free — it does not collide with the RC522 pins (GP16–21) or the onboard LED (GP25).
+
+**Volume note:** the Pico GPIO drives at 3.3 V, so on-board buzzer volume is capped. For louder output, drive the buzzer from **VBUS/5 V** through an **NPN transistor** (GP15 → base via a resistor, buzzer between 5 V and collector, emitter to GND). On a **passive piezo** the resonant peak (~2.7 kHz) is loudest; lower pitches such as the 1500 Hz default tend to be quieter — tune frequency/duration to taste with `BEEPCFG`.
 
 ### Card-type awareness
 

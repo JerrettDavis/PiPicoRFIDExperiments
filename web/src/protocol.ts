@@ -105,6 +105,14 @@ export function buildBeep(freq?: number, ms?: number): string {
   return 'BEEP';
 }
 
+export function buildBeepCfg(freq: number, ms: number): string {
+  return `BEEPCFG ${freq} ${ms}`;
+}
+
+export function buildBeepCfgQuery(): string {
+  return 'BEEPCFG';
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 export function cleanHex(s: string): string {

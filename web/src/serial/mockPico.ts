@@ -64,6 +64,9 @@ class MockPico {
   private destroyed = false;
   /** Buzzer enabled state (default ON, matching firmware). */
   private buzzerOn = true;
+  /** On-detect beep config (default 2700 Hz / 120 ms, matching firmware). */
+  private beepFreq = 2700;
+  private beepMs = 120;
 
   private emitLine: (line: string) => void;
 
@@ -181,7 +184,7 @@ class MockPico {
         break;
 
       case 'HELP':
-        this.emit('OK COMMANDS PING VERSION HELP SCAN READ_BLOCK WRITE_BLOCK READ_PAGE WRITE_PAGE DUMP RESCAN CLONE_READ CLONE_READ_UL MAGIC_DETECT CLONE_UID WRITE_BLOCK_RAW WRITE_TRAILER WRITE_PAGE_RAW ATS APDU BUZZER BEEP');
+        this.emit('OK COMMANDS PING VERSION HELP SCAN READ_BLOCK WRITE_BLOCK READ_PAGE WRITE_PAGE DUMP RESCAN CLONE_READ CLONE_READ_UL MAGIC_DETECT CLONE_UID WRITE_BLOCK_RAW WRITE_TRAILER WRITE_PAGE_RAW ATS APDU BUZZER BEEP BEEPCFG');
         break;
 
       case 'SCAN':
@@ -217,12 +220,33 @@ class MockPico {
       }
 
       case 'BEEP': {
-        const freq = parts[1] !== undefined ? parseInt(parts[1], 10) : 2700;
-        const ms = parts[2] !== undefined ? parseInt(parts[2], 10) : 120;
+        // With no args, BEEP plays the CONFIGURED on-detect beep.
+        const freq = parts[1] !== undefined ? parseInt(parts[1], 10) : this.beepFreq;
+        const ms = parts[2] !== undefined ? parseInt(parts[2], 10) : this.beepMs;
         if (!Number.isFinite(freq) || !Number.isFinite(ms) || freq <= 0 || ms <= 0) {
           this.emit('ERR BAD_BEEP');
         } else {
           this.emit(`OK BEEP ${freq} ${ms}`);
+        }
+        break;
+      }
+
+      case 'BEEPCFG': {
+        if (parts[1] === undefined) {
+          // Query.
+          this.emit(`OK BEEPCFG ${this.beepFreq} ${this.beepMs}`);
+        } else {
+          const freq = parseInt(parts[1], 10);
+          const ms = parseInt(parts[2] ?? '', 10);
+          const validFreq = Number.isFinite(freq) && freq >= 100 && freq <= 10000;
+          const validMs = Number.isFinite(ms) && ms >= 1 && ms <= 2000;
+          if (validFreq && validMs) {
+            this.beepFreq = freq;
+            this.beepMs = ms;
+            this.emit(`OK BEEPCFG ${freq} ${ms}`);
+          } else {
+            this.emit('ERR BAD_BEEP');
+          }
         }
         break;
       }

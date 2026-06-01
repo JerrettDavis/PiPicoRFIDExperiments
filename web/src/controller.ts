@@ -8,7 +8,7 @@ import {
   buildReadPage, buildWritePage, buildRescan, buildRescanQuery,
   buildCloneRead, buildCloneReadUl, buildMagicDetect, buildCloneUid,
   buildWriteBlockRaw, buildWriteTrailer, buildWritePageRaw, buildAts, buildApdu,
-  buildBuzzer, buildBuzzerQuery, buildBeep,
+  buildBuzzer, buildBuzzerQuery, buildBeep, buildBeepCfg, buildBeepCfgQuery,
   cleanHex, sectorRange,
 } from './protocol.js';
 
@@ -131,6 +131,11 @@ export class RfidController {
     const buzzerMatch = payload.match(/^BUZZER\s+(ON|OFF)\b/);
     if (buzzerMatch) {
       return { ok: true, raw, buzzer: { enabled: buzzerMatch[1] === 'ON' } };
+    }
+    // Parse BEEPCFG response: `BEEPCFG <freq> <ms>` (check before BEEP).
+    const beepCfgMatch = payload.match(/^BEEPCFG\s+(\d+)\s+(\d+)/);
+    if (beepCfgMatch) {
+      return { ok: true, raw, beepCfg: { freq: parseInt(beepCfgMatch[1]!, 10), ms: parseInt(beepCfgMatch[2]!, 10) } };
     }
     // Parse BEEP response: `BEEP <freq> <ms>`.
     const beepMatch = payload.match(/^BEEP\s+(\d+)\s+(\d+)/);
@@ -359,5 +364,13 @@ export class RfidController {
 
   async beep(freq?: number, ms?: number): Promise<OpResult> {
     return this.sendCommand(buildBeep(freq, ms));
+  }
+
+  async beepCfg(freq: number, ms: number): Promise<OpResult> {
+    return this.sendCommand(buildBeepCfg(freq, ms));
+  }
+
+  async beepCfgQuery(): Promise<OpResult> {
+    return this.sendCommand(buildBeepCfgQuery());
   }
 }

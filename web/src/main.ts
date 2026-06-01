@@ -45,6 +45,8 @@ import {
   getRawInput,
   getAutoReadToggle,
   getBuzzerToggle,
+  getBeepFreqInput,
+  getBeepMsInput,
   getCloneImportInput,
   getKeyDictToggle,
   getApduInput,
@@ -132,6 +134,18 @@ document.getElementById('testBeep')?.addEventListener('click', async () => {
   appendLog('BEEP', 'tx');
   const result = await controller.beep();
   renderOpResult(result);
+});
+
+async function applyBeepCfg(): Promise<void> {
+  const freq = parseInt(getBeepFreqInput().value, 10) || 0;
+  const ms = parseInt(getBeepMsInput().value, 10) || 0;
+  appendLog(`BEEPCFG ${freq} ${ms}`, 'tx');
+  const result = await controller.beepCfg(freq, ms);
+  renderOpResult(result);
+}
+
+document.getElementById('beepCfgApply')?.addEventListener('click', () => {
+  applyBeepCfg().catch(err => appendLog(String(err)));
 });
 
 // ── Clone workflow ─────────────────────────────────────────────────────────────
@@ -281,6 +295,8 @@ transport.onStatus(connected => {
     void applyRescan();
     // Push the current buzzer toggle state so the firmware matches the UI.
     void applyBuzzer();
+    // Push the current beep config so the firmware matches the UI defaults.
+    void applyBeepCfg();
   } else {
     autoReader.reset();
     cloneController.reset();

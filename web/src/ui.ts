@@ -142,6 +142,14 @@ function buildReadPanel(): HTMLElement {
   const testBeepBtn = btn('testBeep', 'btn-beep', 'Test Beep');
   const beepRow = div({ class: 'buttons' }, testBeepBtn);
 
+  // Beep tuning: frequency / duration + Apply (BEEPCFG).
+  const beepFreqInput = inputEl('beepFreq', 'input-beep-freq', 'number', '1500');
+  beepFreqInput.min = '100'; beepFreqInput.max = '10000';
+  const beepMsInput = inputEl('beepMs', 'input-beep-ms', 'number', '200');
+  beepMsInput.min = '1'; beepMsInput.max = '2000';
+  const beepCfgApplyBtn = btn('beepCfgApply', 'btn-beepcfg', 'Apply');
+  const beepCfgRow = div({ class: 'row' }, beepFreqInput, beepMsInput, beepCfgApplyBtn);
+
   // RESCAN control.
   const rescanInput = inputEl('rescan', 'input-rescan', 'number', '0');
   rescanInput.min = '0';
@@ -169,6 +177,8 @@ function buildReadPanel(): HTMLElement {
     autoReadLabel,
     buzzerLabel,
     beepRow,
+    lbl('beepFreq', 'Beep tuning — frequency (Hz) / duration (ms)'),
+    beepCfgRow,
     lbl('rescan', 'Re-scan interval (ms) — 0 disables'),
     rescanRow,
     mapBtns,
@@ -404,6 +414,8 @@ export function getRescanInput(): HTMLInputElement { return elById('rescan'); }
 export function getRawInput(): HTMLInputElement { return elById('raw'); }
 export function getAutoReadToggle(): HTMLInputElement { return elById('autoRead'); }
 export function getBuzzerToggle(): HTMLInputElement { return elById('buzzer'); }
+export function getBeepFreqInput(): HTMLInputElement { return elById('beepFreq'); }
+export function getBeepMsInput(): HTMLInputElement { return elById('beepMs'); }
 export function getLogEl(): HTMLElement { return elById('log'); }
 export function getCloneImportInput(): HTMLTextAreaElement { return elById('cloneImportInput'); }
 export function getKeyDictToggle(): HTMLInputElement { return elById('keyDict'); }

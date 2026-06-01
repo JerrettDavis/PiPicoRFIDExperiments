@@ -83,8 +83,10 @@ static bool ledRestingState() {
 // both passive piezo and active buzzers. tone() starts a continuous tone on its
 // own PWM/timer; we stop it from beepUpdate() once the duration elapses, so the
 // main loop is never blocked (no tone() duration arg, no delay()).
-static constexpr unsigned     BEEP_FREQ_HZ = 2700;  // default beep frequency (Hz)
-static constexpr unsigned long BEEP_MS     = 120;   // default beep duration (ms)
+// On-detect beep parameters are live-tunable via BEEPCFG. Defaults: a lower,
+// longer beep than the original 2700Hz/120ms.
+static unsigned      detectBeepFreq = 1500;  // on-detect beep frequency (Hz)
+static unsigned long detectBeepMs   = 200;   // on-detect beep duration (ms)
 
 static bool buzzerEnabled = true;          // default ON; gates the intake beep
 static bool beeping = false;               // a beep is currently sounding
@@ -122,8 +124,8 @@ static void beepUpdate() {
 // edge (the same edge where ledPresent transitions false -> true). Central place
 // for intake feedback: LED solid-on plus a single beep (gated by buzzerEnabled).
 static void onCardIntake() {
-  ledWrite(true);                    // card just arrived -> resting state is ON
-  beepStart(BEEP_FREQ_HZ, BEEP_MS);  // one beep per genuine detection (gated)
+  ledWrite(true);                          // card just arrived -> resting state ON
+  beepStart(detectBeepFreq, detectBeepMs); // one beep per genuine detection (gated)
 }
 
 // Called from pollCardEvents() on debounced presence edges.
@@ -157,6 +159,34 @@ static void ledUpdate() {
   } else {
     ledWrite(ledRestingState());   // resting: ON if card present, else OFF
   }
+}
+
+// --- LED busy/ingest activity flash ----------------------------------------
+// Steady ~120ms blink for use INSIDE long synchronous operations (CLONE_READ,
+// CLONE_READ_UL, DUMP). Call repeatedly from the operation's inner loops; it
+// only toggles when the interval elapses, so it is cheap and non-blocking
+// (millis() + digitalWrite only — no delay()). It bypasses ledUpdate()'s
+// resting/flash logic because those bulk loops run synchronously and ledUpdate()
+// is not ticking during them.
+static constexpr unsigned long LED_ACTIVITY_MS = 120;  // blink half-period (ms)
+static unsigned long ledActivityLastToggleMs = 0;
+static bool ledBusyState = false;
+
+static void ledActivityTick() {
+  unsigned long now = millis();
+  if (now - ledActivityLastToggleMs >= LED_ACTIVITY_MS) {
+    ledActivityLastToggleMs = now;
+    ledBusyState = !ledBusyState;
+    ledWrite(ledBusyState);
+  }
+}
+
+// Call after a bulk operation completes: restore the resting LED state and clear
+// the activity toggle so the next bulk op starts from a known (off) phase.
+static void ledActivityDone() {
+  ledBusyState = false;
+  ledActivityLastToggleMs = 0;
+  ledWrite(ledRestingState());  // solid ON if card still present, else OFF
 }
 
 static String statusName(MFRC522::StatusCode status) {
@@ -217,6 +247,7 @@ static void printHelp() {
   Serial.println("  VERSION");
   Serial.println("  BUZZER [ON|OFF]");
   Serial.println("  BEEP [<freq> <ms>]");
+  Serial.println("  BEEPCFG [<freq> <ms>]");
   Serial.println("  RESCAN [ms]");
   Serial.println("  SCAN");
   Serial.println("  READ_BLOCK <block> [keyAhex12]");
@@ -245,6 +276,7 @@ static void printHelp() {
   Serial.println("  ATS/APDU target ISO-14443-4 cards; APDU req/resp limited to 60 bytes");
   Serial.println("  BUZZER ON|OFF gates the per-detection beep (default ON); BEEP is a manual test");
   Serial.println("  Buzzer is on GP15; BEEP fires even when BUZZER is OFF");
+  Serial.println("  BEEPCFG <freq> <ms> tunes the on-detect beep (default 1500Hz/200ms); no-arg queries");
 }
 
 static bool selectCard() {
@@ -503,11 +535,12 @@ static void commandBuzzer(const String& arg) {
   }
 }
 
-// BEEP fires a manual test beep at defaults, or BEEP <freq> <ms> at the given
-// values (validated). The test beep fires even when buzzerEnabled is OFF.
+// BEEP (no args) plays the CONFIGURED on-detect beep as a test; BEEP <freq> <ms>
+// does a one-off override beep (validated). Either form fires even when
+// buzzerEnabled is OFF (it is an explicit manual test).
 static void commandBeep(const String& freqStr, const String& msStr) {
-  unsigned freq = BEEP_FREQ_HZ;
-  unsigned long ms = BEEP_MS;
+  unsigned freq = detectBeepFreq;
+  unsigned long ms = detectBeepMs;
   if (freqStr.length() > 0 || msStr.length() > 0) {
     if (freqStr.length() == 0 || msStr.length() == 0) {
       Serial.println("ERR BAD_BEEP");
@@ -527,6 +560,34 @@ static void commandBeep(const String& freqStr, const String& msStr) {
   Serial.print(freq);
   Serial.print(' ');
   Serial.println(ms);
+}
+
+// BEEPCFG <freq> <ms> sets the live on-detect beep parameters; BEEPCFG (no args)
+// queries them. Does not play a sound.
+static void commandBeepCfg(const String& freqStr, const String& msStr) {
+  if (freqStr.length() == 0 && msStr.length() == 0) {
+    Serial.print("OK BEEPCFG ");
+    Serial.print(detectBeepFreq);
+    Serial.print(' ');
+    Serial.println(detectBeepMs);
+    return;
+  }
+  if (freqStr.length() == 0 || msStr.length() == 0) {
+    Serial.println("ERR BAD_BEEP");
+    return;
+  }
+  long f = freqStr.toInt();
+  long m = msStr.toInt();
+  if (f < 100 || f > 10000 || m < 1 || m > 2000) {
+    Serial.println("ERR BAD_BEEP");
+    return;
+  }
+  detectBeepFreq = (unsigned)f;
+  detectBeepMs = (unsigned long)m;
+  Serial.print("OK BEEPCFG ");
+  Serial.print(detectBeepFreq);
+  Serial.print(' ');
+  Serial.println(detectBeepMs);
 }
 
 static void commandVersion() {
@@ -708,6 +769,7 @@ static void commandDump(byte startBlock, byte endBlock, const String& keyHex) {
   bool authed = false;
 
   for (byte block = startBlock; block <= endBlock; block++) {
+    ledActivityTick();  // busy-flash per block during the bulk dump
     byte trailer = trailerForBlock(block);
     if (!authed || trailer != lastTrailer) {
       stopCardCrypto();
@@ -738,6 +800,7 @@ static void commandDump(byte startBlock, byte endBlock, const String& keyHex) {
   }
 
   stopCardCrypto();
+  ledActivityDone();  // restore resting LED state after the bulk dump
   Serial.println("OK DUMP_END");
 }
 
@@ -858,6 +921,7 @@ static void cloneReadClassic() {
   byte okSectors = 0, failedSectors = 0;
 
   for (byte s = 0; s < sectors; s++) {
+    ledActivityTick();  // busy-flash per sector during the bulk read
     String keyHex; char keyType;
     bool authed = authSectorWithDict(s, keyHex, keyType);
 
@@ -890,6 +954,7 @@ static void cloneReadClassic() {
     byte first = firstBlockOfSector(s);
     byte count = blocksInSector(s);
     for (byte b = first; b < first + count; b++) {
+      ledActivityTick();  // busy-flash per block during the bulk read
       byte buffer[18]; byte sz = sizeof(buffer);
       MFRC522::StatusCode st = rfid.MIFARE_Read(b, buffer, &sz);
       Serial.print("BLOCK=");
@@ -907,6 +972,7 @@ static void cloneReadClassic() {
 
   rfid.PICC_HaltA();
   rfid.PCD_StopCrypto1();
+  ledActivityDone();  // restore resting LED state after the bulk read
   Serial.print("OK CLONE_END OK_SECTORS=");
   Serial.print(okSectors);
   Serial.print(" FAILED_SECTORS=");
@@ -940,6 +1006,7 @@ static void cloneReadUltralight() {
 
   byte okPages = 0, failedPages = 0;
   for (byte p = 0; p < pageCount; p++) {
+    ledActivityTick();  // busy-flash per page during the bulk read
     byte buf[18]; byte sz = sizeof(buf);
     // Read 4 pages at p but emit only this single page's 4 bytes.
     MFRC522::StatusCode st = rfid.MIFARE_Read(p, buf, &sz);
@@ -956,6 +1023,7 @@ static void cloneReadUltralight() {
     }
   }
   rfid.PICC_HaltA();
+  ledActivityDone();  // restore resting LED state after the bulk read
   Serial.print("OK ULDUMP_END OK_PAGES=");
   Serial.print(okPages);
   Serial.print(" FAILED_PAGES=");
@@ -1465,6 +1533,10 @@ static void handleCommand(String line) {
     String freqStr = nextToken(rest);
     String msStr = nextToken(rest);
     commandBeep(freqStr, msStr);
+  } else if (cmd == "BEEPCFG") {
+    String freqStr = nextToken(rest);
+    String msStr = nextToken(rest);
+    commandBeepCfg(freqStr, msStr);
   } else if (cmd == "RESCAN") {
     String msStr = nextToken(rest);
     if (msStr.length() == 0) {

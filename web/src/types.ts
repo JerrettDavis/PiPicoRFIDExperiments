@@ -123,6 +123,8 @@ export interface OpResult {
   buzzer?: { enabled: boolean };
   /** Beep parameters confirmed by the firmware (BEEP command). */
   beep?: { freq: number; ms: number };
+  /** On-detect beep config confirmed by the firmware (BEEPCFG command/query). */
+  beepCfg?: { freq: number; ms: number };
   error?: string;
 }
 
